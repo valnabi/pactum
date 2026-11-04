@@ -1,0 +1,23 @@
+[package]
+name = "pactum-demo"
+description = "Durable reference counter participants and executable Pactum demonstration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+pactum-core.workspace = true
+pactum-journal.workspace = true
+pactum-sqlite.workspace = true
+async-trait.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
