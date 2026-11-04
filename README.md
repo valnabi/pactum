@@ -14,7 +14,7 @@ is reported explicitly; recovery never reverses a recorded decision.
 
 | Crate | Responsibility |
 | --- | --- |
-| `pactum-core` | Stable IDs, multi-mode execution, 2PC, recovery, cancellation and typed status |
+| `pactum-core` | Stable IDs, multi-mode execution, 2PC, durable transaction DAGs, recovery and cancellation |
 | `pactum-journal` | Independent ordered byte journal and explicit durability barrier |
 | `pactum-sqlite` | SQLite WAL/FULL journal plus transactional receipt and publish reference backend |
 | `pactum-demo` | Durable 2PC counters, mode examples and crash tests |
@@ -39,6 +39,18 @@ closing/reopening storage, publishes a snapshot with a fenced visible-version
 switch, and commits the existing 2PC operation. Native counter total is `17`;
 published snapshot value is `42`; 2PC counters are `10` and `20`.
 Atomic, Chunked and StagedPublish also have standalone examples.
+
+## Durable transaction plans
+
+The [transaction plan guide](docs/transaction-plans.md) describes versioned DAGs,
+immutable payload bindings, bounded concurrent scheduling, exclusive resource scopes
+and durable restart reconciliation. Steps invoke Atomic, Chunked, StagedPublish or
+2PC with explicit per-step guarantees. A completed plan means every step succeeded;
+plans do not provide global atomicity or rollback previously completed effects.
+
+```sh
+cargo run -p pactum-demo --example transaction_plan -- ./transaction-plan-data
+```
 
 ## Run the 2PC demonstration
 
@@ -95,7 +107,7 @@ Journal checkpoints compact or archive covered events while permanently retainin
 retry bindings, decisions and pending state. SQLite streams the remaining tail;
 `recover_pending` uses a pending-work index. See the
 [journal lifecycle guide](docs/journal-lifecycle.md) for APIs, crash guarantees,
-retention limits and replay benchmarks. Work is sequential in deterministic ID order. There is
+retention limits and replay benchmarks. Mode/coordinator recovery visits keys in deterministic ID order. Plan steps use bounded concurrent DAG scheduling. There is
 no consensus, active-active failover, remote transport or saga engine.
 An optional [recovery service](docs/recovery-service.md) schedules subsequent
 recovery passes with durable backoff, operator controls and observability.

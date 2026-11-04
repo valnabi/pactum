@@ -1,6 +1,6 @@
 # Optional recovery service
 
-`pactum_core::recovery` wraps the existing Coordinator and multi-mode Engine.
+`pactum_core::recovery` wraps the existing Coordinator, multi-mode Engine and bounded PlanEngine.
 It is optional: direct `execute`, `recover`, `recover_pending` and status APIs
 keep their existing behavior. It uses Tokio, already required by core, and has
 no Aquanet, ContentGraph, transport, worker or hosting dependency.
@@ -16,7 +16,7 @@ same journal or reuse a namespace/schedule database for a different engine.
 use pactum_core::recovery::{Config, Control, Runner};
 use pactum_sqlite::SqliteJournal;
 
-// `engine` is an opened Coordinator or Engine with existing durable work.
+// `engine` is an opened Coordinator, Engine or PlanEngine with durable work.
 let runner = Runner::open(
     engine,
     SqliteJournal::open("recovery-schedule.db")?,

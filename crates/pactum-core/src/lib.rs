@@ -934,3 +934,6 @@ pub mod execution;
 
 /// Optional host-neutral recovery scheduling and operator controls.
 pub mod recovery;
+
+/// Durable bounded transaction plans and mode adapters.
+pub mod plan;

@@ -211,6 +211,7 @@ dependencies = [
  "pactum-journal",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

@@ -113,7 +113,7 @@ impl Request {
             Self::StagedPublish(_) => Mode::StagedPublish,
         }
     }
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if matches!(self, Self::Chunked(r) if r.chunks.is_empty()) {
             return Err(Error::Invalid("at least one chunk required".into()));
         }
