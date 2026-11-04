@@ -7,7 +7,10 @@ use crate::{Cancellation, Coordinator, Enlistment, Error, Status, TransactionId}
 use async_trait::async_trait;
 use pactum_journal::Journal;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 identifier!(
     OperationId,
@@ -477,6 +480,34 @@ fn apply(states: &mut BTreeMap<OperationId, State>, record: &Record) -> Result<(
     }
     Ok(())
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    backend: String,
+    states: Vec<(OperationId, Request, Progress)>,
+}
+// Validate reachability from the initial state, without replaying every chunk.
+fn validate_snapshot_progress(request: &Request, progress: &Progress) -> Result<(), Error> {
+    request
+        .validate()
+        .map_err(|e| Error::Corrupt(e.to_string()))?;
+    let valid = match (request, progress) {
+        (Request::Atomic(_), Progress::Atomic(_)) => true,
+        (Request::StagedPublish(_), Progress::StagedPublish(_)) => true,
+        (Request::Chunked(r), Progress::Chunked(s)) => {
+            s.total == r.chunks.len()
+                && s.completed <= s.total
+                && !(s.rejected && (s.uncertain || s.paused))
+                && (s.completed < s.total || (!s.rejected && !s.uncertain && !s.paused))
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Corrupt("unreachable checkpoint progress".into()))
+    }
+}
 /// Single-owner engine for Atomic, Chunked and StagedPublish. Uses a dedicated
 /// version-2 journal, leaving the v0.1 Coordinator and its journal unchanged.
 /// Backend identity is bound in the first flushed record before any work.
@@ -484,6 +515,7 @@ pub struct Engine<J: Journal, B: Backend> {
     journal: J,
     backend: B,
     states: BTreeMap<OperationId, State>,
+    pending: BTreeSet<OperationId>,
     policy: ExecutionPolicy,
     poisoned: bool,
     sequence: u64,
@@ -494,45 +526,110 @@ impl<J: Journal, B: Backend> Engine<J, B> {
         if policy.max_chunks == 0 || policy.max_unit_bytes == 0 {
             return Err(Error::Invalid("positive execution limits required".into()));
         }
-        let entries = journal
-            .replay()
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
         let mut states = BTreeMap::new();
         let mut sequence = 0;
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.sequence != index as u64 + 1 || entry.version != 2 {
+        if let Some(checkpoint) = journal
+            .checkpoint()
+            .map_err(|e| Error::Corrupt(e.to_string()))?
+        {
+            if checkpoint.version != 2 || checkpoint.watermark == 0 {
+                return Err(Error::Corrupt("unsupported multi-mode checkpoint".into()));
+            }
+            let snapshot: Snapshot = serde_json::from_slice(&checkpoint.payload)
+                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            if snapshot.backend != backend.identity()
+                || snapshot.states.len() as u64 >= checkpoint.watermark
+            {
                 return Err(Error::Corrupt(
-                    "sequence gap or unsupported multi-mode schema".into(),
+                    "checkpoint namespace or watermark mismatch".into(),
                 ));
             }
-            let record: Record = serde_json::from_slice(&entry.payload)
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
-            if index == 0 {
-                if !matches!(record, Record::Header { backend: ref identity } if *identity == backend.identity())
+            for (id, request, progress) in snapshot.states {
+                validate_snapshot_progress(&request, &progress)?;
+                if states
+                    .insert(
+                        id,
+                        State {
+                            request,
+                            progress,
+                            last_error: None,
+                        },
+                    )
+                    .is_some()
                 {
-                    return Err(Error::Corrupt(
-                        "backend namespace/incarnation mismatch".into(),
-                    ));
+                    return Err(Error::Corrupt("duplicate checkpoint key".into()));
                 }
-            } else {
-                apply(&mut states, &record)?;
             }
-            sequence = entry.sequence;
+            sequence = checkpoint.watermark;
         }
+        journal.visit(&mut |entry| {
+            let result = (|| {
+                if Some(entry.sequence) != sequence.checked_add(1) || entry.version != 2 {
+                    return Err(Error::Corrupt("sequence gap or unsupported multi-mode schema".into()));
+                }
+                let record: Record = serde_json::from_slice(&entry.payload).map_err(|e| Error::Corrupt(e.to_string()))?;
+                if sequence == 0 {
+                    if !matches!(record, Record::Header { backend: ref identity } if *identity == backend.identity()) {
+                        return Err(Error::Corrupt("backend namespace/incarnation mismatch".into()));
+                    }
+                } else { apply(&mut states, &record)?; }
+                sequence = entry.sequence;
+                Ok(())
+            })();
+            result.map_err(|e: Error| pactum_journal::JournalError(e.to_string()))
+        }).map_err(|e| Error::Corrupt(e.to_string()))?;
         let mut engine = Self {
             journal,
             backend,
+            pending: states
+                .iter()
+                .filter(|(_, s)| !s.progress.is_terminal())
+                .map(|(id, _)| id.clone())
+                .collect(),
             states,
             policy,
             poisoned: false,
             sequence,
         };
-        if entries.is_empty() {
+        if sequence == 0 {
             engine.write(&Record::Header {
                 backend: engine.backend.identity(),
             })?;
         }
         Ok(engine)
+    }
+    /// Atomically checkpoint every mode, pending phase and permanent request
+    /// binding, then compact or archive covered events. Backend receipts and
+    /// publication tombstones must also be retained by the backend forever.
+    pub fn compact(&mut self, retention: pactum_journal::Retention) -> Result<(), Error> {
+        self.healthy()?;
+        let snapshot = Snapshot {
+            backend: self.backend.identity(),
+            states: self
+                .states
+                .iter()
+                .map(|(id, s)| (id.clone(), s.request.clone(), s.progress.clone()))
+                .collect(),
+        };
+        let payload = serde_json::to_vec(&snapshot).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.poisoned = true;
+        self.journal
+            .compact(self.sequence, 2, &payload, retention)
+            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        self.poisoned = false;
+        Ok(())
+    }
+    /// Recover indexed nonterminal operations in ID order. Paused chunks remain
+    /// paused. Terminal request bindings are retained without enumerating them.
+    pub fn recover_pending(
+        &mut self,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<OperationStatus>, Error> {
+        self.healthy()?;
+        let ids: Vec<_> = self.pending.iter().cloned().collect();
+        ids.iter()
+            .map(|id| self.advance(id, cancellation))
+            .collect()
     }
     /// Read backend diagnostics and values without bypassing engine writes.
     pub fn backend(&self) -> &B {
@@ -567,10 +664,26 @@ impl<J: Journal, B: Backend> Engine<J, B> {
         Ok(())
     }
     fn persist(&mut self, record: Record) -> Result<(), Error> {
-        let mut next = self.states.clone();
+        let id = match &record {
+            Record::Begin { id, .. } | Record::Progress { id, .. } => id,
+            Record::Header { .. } => unreachable!(),
+        }
+        .clone();
+        let mut next = BTreeMap::new();
+        if let Some(state) = self.states.get(&id) {
+            next.insert(id.clone(), state.clone());
+        }
         apply(&mut next, &record)?;
         self.write(&record)?;
-        self.states = next;
+        let state = next
+            .remove(&id)
+            .expect("validated transition retains state");
+        if state.progress.is_terminal() {
+            self.pending.remove(&id);
+        } else {
+            self.pending.insert(id.clone());
+        }
+        self.states.insert(id, state);
         Ok(())
     }
     fn progress(&mut self, id: &OperationId, progress: Progress) -> Result<(), Error> {
@@ -766,11 +879,8 @@ impl<J: Journal, B: Backend> Execution for Engine<J, B> {
         &mut self,
         cancellation: &Cancellation,
     ) -> Result<Vec<OperationStatus>, Error> {
-        self.healthy()?;
-        let ids: Vec<_> = self.states.keys().cloned().collect();
-        ids.iter()
-            .map(|id| self.advance(id, cancellation))
-            .collect()
+        self.recover_pending(cancellation)?;
+        Ok(self.states.keys().map(|id| self.snapshot(id)).collect())
     }
 }
 

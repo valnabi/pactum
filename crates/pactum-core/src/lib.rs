@@ -358,7 +358,7 @@ pub struct Diagnostics {
     pub durable_records: u64,
     /// Number of recovery passes invoked in this process.
     pub recovery_passes: u64,
-    /// Number of transactions retained in the append-only history.
+    /// Number of permanent transaction bindings in recovered state.
     pub transactions: usize,
     /// Number of transactions still lacking every final acknowledgement.
     pub pending_transactions: usize,
@@ -374,6 +374,7 @@ pub struct Coordinator<J: Journal> {
     journal: J,
     participants: BTreeMap<ParticipantId, Arc<dyn Participant>>,
     states: BTreeMap<TransactionId, State>,
+    pending: BTreeSet<TransactionId>,
     policy: RetryPolicy,
     poisoned: bool,
     durable_sequence: u64,
@@ -394,25 +395,46 @@ impl<J: Journal> Coordinator<J> {
         }
         let mut states = BTreeMap::new();
         let mut durable_sequence = 0;
-        for (index, entry) in journal
-            .replay()
+        if let Some(checkpoint) = journal
+            .checkpoint()
             .map_err(|e| Error::Corrupt(e.to_string()))?
-            .into_iter()
-            .enumerate()
         {
-            if entry.sequence != index as u64 + 1 || entry.version != 1 {
-                return Err(Error::Corrupt(
-                    "sequence gap or unsupported protocol version".into(),
-                ));
+            if checkpoint.version != 1 {
+                return Err(Error::Corrupt("unsupported 2PC checkpoint".into()));
             }
-            let record = serde_json::from_slice(&entry.payload)
+            let records: Vec<Record> = serde_json::from_slice(&checkpoint.payload)
                 .map_err(|e| Error::Corrupt(e.to_string()))?;
-            apply(&mut states, record)?;
-            durable_sequence = entry.sequence;
+            if records.len() as u64 > checkpoint.watermark {
+                return Err(Error::Corrupt("checkpoint exceeds watermark".into()));
+            }
+            for record in records {
+                apply(&mut states, record)?;
+            }
+            durable_sequence = checkpoint.watermark;
         }
+        journal
+            .visit(&mut |entry| {
+                if Some(entry.sequence) != durable_sequence.checked_add(1) || entry.version != 1 {
+                    return Err(pactum_journal::JournalError(
+                        "sequence gap or unsupported protocol version".into(),
+                    ));
+                }
+                let record = serde_json::from_slice(&entry.payload)
+                    .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
+                apply(&mut states, record)
+                    .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
+                durable_sequence = entry.sequence;
+                Ok(())
+            })
+            .map_err(|e| Error::Corrupt(e.to_string()))?;
         let mut coordinator = Self {
             journal,
             participants: BTreeMap::new(),
+            pending: states
+                .iter()
+                .filter(|(_, s)| s.acknowledged.len() != s.requests.len())
+                .map(|(id, _)| id.clone())
+                .collect(),
             states,
             policy,
             poisoned: false,
@@ -423,6 +445,45 @@ impl<J: Journal> Coordinator<J> {
             coordinator.register(participant)?;
         }
         Ok(coordinator)
+    }
+    /// Checkpoint all durable state and compact covered events. Permanent key
+    /// bindings, prepare tokens, decisions and acknowledgements are retained.
+    /// On any installation error, drop and reopen before using this coordinator.
+    pub fn compact(&mut self, retention: pactum_journal::Retention) -> Result<(), Error> {
+        self.healthy()?;
+        let mut records = Vec::new();
+        for (tx, state) in &self.states {
+            records.push(Record::Begin {
+                tx: tx.clone(),
+                requests: state.requests.clone(),
+            });
+            for (participant, token) in &state.prepared {
+                records.push(Record::Prepared {
+                    tx: tx.clone(),
+                    participant: participant.clone(),
+                    token: token.clone(),
+                });
+            }
+            if let Some(decision) = state.decision {
+                records.push(Record::Decided {
+                    tx: tx.clone(),
+                    decision,
+                });
+            }
+            for participant in &state.acknowledged {
+                records.push(Record::Acknowledged {
+                    tx: tx.clone(),
+                    participant: participant.clone(),
+                });
+            }
+        }
+        let payload = serde_json::to_vec(&records).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.poisoned = true;
+        self.journal
+            .compact(self.durable_sequence, 1, &payload, retention)
+            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        self.poisoned = false;
+        Ok(())
     }
     /// Add an available resource. Never silently replace an existing identity.
     pub fn register(&mut self, participant: Arc<dyn Participant>) -> Result<(), Error> {
@@ -444,7 +505,17 @@ impl<J: Journal> Coordinator<J> {
     }
     fn persist(&mut self, record: Record) -> Result<(), Error> {
         self.healthy()?;
-        let mut next = self.states.clone();
+        let tx = match &record {
+            Record::Begin { tx, .. }
+            | Record::Prepared { tx, .. }
+            | Record::Decided { tx, .. }
+            | Record::Acknowledged { tx, .. } => tx,
+        }
+        .clone();
+        let mut next = BTreeMap::new();
+        if let Some(state) = self.states.get(&tx) {
+            next.insert(tx.clone(), state.clone());
+        }
         apply(&mut next, record.clone())?;
         let bytes = serde_json::to_vec(&record).map_err(|e| Error::Invalid(e.to_string()))?;
         // No await between append, barrier, and publishing state.
@@ -457,12 +528,20 @@ impl<J: Journal> Coordinator<J> {
             .journal
             .flush()
             .map_err(|e| Error::InDoubt(e.to_string()))?;
-        if durable != sequence {
+        if Some(sequence) != self.durable_sequence.checked_add(1) || durable != sequence {
             return Err(Error::InDoubt(
                 "barrier did not cover appended record".into(),
             ));
         }
-        self.states = next;
+        let state = next
+            .remove(&tx)
+            .expect("validated transition retains state");
+        if state.acknowledged.len() == state.requests.len() {
+            self.pending.remove(&tx);
+        } else {
+            self.pending.insert(tx.clone());
+        }
+        self.states.insert(tx, state);
         self.durable_sequence = durable;
         self.poisoned = false;
         Ok(())
@@ -579,9 +658,21 @@ impl<J: Journal> Coordinator<J> {
     /// Reconcile every transaction in transaction-ID order. No new prepare is
     /// issued during recovery. Undecided work gets a durable abort first.
     pub async fn recover(&mut self, cancellation: &Cancellation) -> Result<Vec<Status>, Error> {
+        self.recover_pending(cancellation).await?;
+        self.states
+            .keys()
+            .map(|id| self.status(id).map(Option::unwrap))
+            .collect()
+    }
+    /// Reconcile only the indexed pending transactions, returning their statuses.
+    /// Cost excludes enumerating permanent terminal retry bindings.
+    pub async fn recover_pending(
+        &mut self,
+        cancellation: &Cancellation,
+    ) -> Result<Vec<Status>, Error> {
         self.healthy()?;
         self.recovery_passes += 1;
-        let ids: Vec<_> = self.states.keys().cloned().collect();
+        let ids: Vec<_> = self.pending.iter().cloned().collect();
         let mut statuses = Vec::new();
         for tx in ids {
             statuses.push(self.reconcile(&tx, cancellation).await?);

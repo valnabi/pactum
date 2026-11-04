@@ -1,6 +1,6 @@
 # ADR 0003: Multi-mode execution and receipt-protected recovery
 
-Status: accepted for v0.2. Implements #11 and its contract/journal work (#12–#13).
+Status: accepted for v0.2. Implements #11 and its contract/journal work (#12ā€“#13).
 
 ## Decision
 
@@ -101,3 +101,8 @@ continue to work. Opting into `Execution` on a coordinator uses fully qualified
 trait calls where its inherent `execute` has the original signature. Native modes
 need new dedicated journal and backend paths; do not migrate an existing 2PC
 journal by changing its version tag. Workspace release version becomes 0.2.0.
+
+Journal lifecycle update (#19): the original deferral of compaction is superseded
+by the [checkpoint/retention contract](../journal-lifecycle.md). Permanent retry
+bindings and resource tombstones remain required; only covered event history can
+be discarded or archived.

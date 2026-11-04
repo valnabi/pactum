@@ -89,6 +89,7 @@ async fn atomic_rollback_idempotency_and_immutable_binding() {
         Progress::Atomic(AtomicStatus::Aborted)
     );
     assert_eq!(e.backend().value("other").unwrap(), 0);
+    e.compact(pactum_journal::Retention::Compact).unwrap();
     drop(e);
     let mut e = open(temp.path(), ExecutionPolicy::default());
     assert_eq!(
@@ -127,6 +128,7 @@ async fn partial_chunks_pause_restart_and_resume_with_stable_total() {
         })
     ));
     e.cancel(&id("job")).await.unwrap();
+    e.compact(pactum_journal::Retention::Compact).unwrap();
     drop(e);
     let mut e = open(temp.path(), policy);
     assert!(matches!(
@@ -207,6 +209,7 @@ async fn staged_visibility_fencing_receipts_and_cleanup() {
     assert_eq!(visible.generation, 2);
     assert_eq!(visible.version, id("second"));
     assert_eq!(visible.values[0].value, 99);
+    e.compact(pactum_journal::Retention::Compact).unwrap();
     drop(e);
     let mut backend = SqliteBackend::open(temp.path().join("backend.db"), "test").unwrap();
     let Request::StagedPublish(first) = request("publish") else {
@@ -241,6 +244,7 @@ async fn identity_limits_and_separate_journal_schemas_fail_closed() {
             .is_err()
     );
     assert!(e.status(&id("a")).unwrap().is_none());
+    e.compact(pactum_journal::Retention::Compact).unwrap();
     drop(e);
     assert!(SqliteBackend::open(temp.path().join("backend.db"), "changed").is_err());
     assert!(
@@ -410,6 +414,11 @@ async fn attempt(path: &Path, scenario: &str, target: usize, kill: bool) -> usiz
 }
 async fn verify(path: &Path, scenario: &str) {
     let mut e = open(path, ExecutionPolicy::default());
+    let before = e.status(&id("work")).unwrap();
+    e.compact(pactum_journal::Retention::Archive).unwrap();
+    drop(e);
+    let mut e = open(path, ExecutionPolicy::default());
+    assert_eq!(before, e.status(&id("work")).unwrap());
     let c = Cancellation::default();
     if scenario == "cancel" {
         // Repeat cancellation intent if death preceded the durable intent record.
@@ -443,6 +452,22 @@ async fn verify(path: &Path, scenario: &str) {
         assert!(!e.backend().has_artifact(&id("work")).unwrap());
     }
     assert_eq!(e.recover(&c).await.unwrap()[0].progress, s.progress);
+    assert!(e.recover_pending(&c).unwrap().is_empty());
+    e.compact(pactum_journal::Retention::Compact).unwrap();
+    drop(e);
+    let mut e = open(path, ExecutionPolicy::default());
+    assert_eq!(e.status(&id("work")).unwrap().unwrap().progress, s.progress);
+    assert!(matches!(
+        e.execute(
+            id("work"),
+            Request::Atomic(AtomicRequest {
+                payload: payload(999)
+            }),
+            &c
+        )
+        .await,
+        Err(Error::Invalid(_))
+    ));
 }
 #[tokio::test]
 async fn uncertain_writes_and_lost_backend_responses_at_every_boundary() {
@@ -618,5 +643,62 @@ async fn uncertain_backend_commit_is_never_reported_as_success_or_undone_by_canc
         drop(e);
         // Explicit execute resumes a paused batch; all receipts suppress reapplication.
         verify(temp.path(), scenario).await;
+    }
+}
+
+#[test]
+fn checkpoint_rejects_invalid_state_even_with_valid_storage_checksum() {
+    for kind in [
+        "duplicate",
+        "wrong-mode",
+        "chunk-overrun",
+        "chunk-total",
+        "terminal-flags",
+        "namespace",
+        "schema",
+        "watermark",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(temp.path().join("backend.db"), "test").unwrap();
+        let identity = backend.identity();
+        let req = request("chunked");
+        let progress = Progress::Chunked(ChunkStatus {
+            completed: 1,
+            total: 3,
+            uncertain: false,
+            paused: false,
+            rejected: false,
+        });
+        let state = serde_json::json!(["work", req, progress]);
+        let mut snapshot = serde_json::json!({"backend": identity, "states": [state.clone()]});
+        match kind {
+            "duplicate" => snapshot["states"].as_array_mut().unwrap().push(state),
+            "wrong-mode" => snapshot["states"][0][2] = serde_json::json!({"Atomic": "Committed"}),
+            "chunk-overrun" => snapshot["states"][0][2]["Chunked"]["completed"] = 4.into(),
+            "chunk-total" => snapshot["states"][0][2]["Chunked"]["total"] = 4.into(),
+            "terminal-flags" => {
+                snapshot["states"][0][2]["Chunked"]["completed"] = 3.into();
+                snapshot["states"][0][2]["Chunked"]["paused"] = true.into();
+            }
+            "namespace" => snapshot["backend"] = "other".into(),
+            _ => {}
+        }
+        let mut j = SqliteJournal::open(temp.path().join("j.db")).unwrap();
+        let watermark = if kind == "watermark" { 1 } else { 10 };
+        for _ in 0..watermark {
+            j.append(2, b"covered").unwrap();
+        }
+        j.flush().unwrap();
+        j.compact(
+            watermark,
+            if kind == "schema" { 3 } else { 2 },
+            &serde_json::to_vec(&snapshot).unwrap(),
+            pactum_journal::Retention::Compact,
+        )
+        .unwrap();
+        assert!(
+            Engine::open(j, backend, ExecutionPolicy::default()).is_err(),
+            "{kind}"
+        );
     }
 }

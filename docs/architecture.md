@@ -45,7 +45,7 @@ can override an uncertain write.
 
 ## Recovery
 
-`Coordinator::open` reads and strictly validates the complete durable history.
+`Coordinator::open` restores validated checkpoint state and streams the durable tail.
 It does not dispatch participant work. Applications call `recover` before new
 execution, and again as needed. Each pass visits transactions and participants in
 stable lexicographic ID order. There is no automatic background task.
@@ -95,7 +95,7 @@ An `Aborted` or `Committed` outcome requires every durable acknowledgement.
 ## Journal storage and failure assumptions
 
 `append` stages an ordered record, `flush` atomically persists all staged records,
-and `replay` returns only the durable prefix. An unflushed batch may disappear on
+and `replay` returns only the durable tail after any checkpoint. An unflushed batch may disappear on
 crash. Barrier errors are ambiguous regardless of whether the backend reports
 failure before or after an actual commit. Each backend needs exclusive ownership.
 
@@ -104,8 +104,8 @@ synchronous=FULL, and `BEGIN IMMEDIATE` / `COMMIT` per flush batch. Opening veri
 settings, schema version and `quick_check`. Sequence, consumer version, payload
 and SHA-256 checksum are stored per row; replay rejects gaps and mismatches.
 SQLite handles incomplete physical WAL tails atomically. Checksums detect accidental
-record corruption; they do not detect intentional tail deletion or provide an
-external integrity authority. Physical truncation/corruption fails closed when
+record corruption; a checksummed durable head also rejects missing tail rows and
+checkpoint generations. They do not provide an external integrity authority. Physical truncation/corruption fails closed when
 SQLite cannot recover its committed prefix. No repair silently changes a decision.
 
 Use a local filesystem that supports SQLite WAL locks and correctly honors sync.
@@ -126,9 +126,9 @@ delta demonstrates abort. The two databases have independent durability domains.
 
 There is no generic resource isolation layer, global atomic read snapshot, network
 transport, distributed coordinator consensus, active-active failover, saga engine,
-Aquanet/ContentGraph runtime, or FoundationDB backend. History is append-only and
-fully replayed in memory; compaction/checkpoints are deferred. Adapters can be
-added by consumers through `Participant`, and other storage through `Journal`.
+Aquanet/ContentGraph runtime, or FoundationDB backend. Active history is streamed
+after a validated checkpoint; see [journal lifecycle](journal-lifecycle.md).
+Adapters can be added by consumers through `Participant`, and other storage through `Journal`.
 
 ## v0.2 native execution
 

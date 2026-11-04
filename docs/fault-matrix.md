@@ -72,3 +72,13 @@ cancellation never undoes committed native work or a publish CAS.
 mode transitions, checkpoint jumps, terminal reversals, missing begins and
 repeated headers. Existing v0.1 protocol and process-death tests run unchanged.
 These process exits model crash boundaries, not arbitrary hardware power loss.
+
+## Journal lifecycle (#19)
+
+SQLite tests terminate child processes at six compaction barriers for initial and
+replacement generations and both retention policies. Reopen must see the complete
+old generation or the complete new one. Snapshot/header/checksum corruption,
+missing checkpoint/head/tail, staging and watermark mismatch, legacy migration,
+archive export, failed writes and lost compaction acknowledgements are covered.
+The protocol and multi-mode restart matrices also compact and reopen recovered
+prefixes before further dispatch. See [lifecycle invariants](journal-lifecycle.md).

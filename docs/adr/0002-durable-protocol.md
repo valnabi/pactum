@@ -23,3 +23,8 @@ extends ADR 0001's three-library bootstrap without adding a facade or unused lay
 
 Retain full journal history and resource terminal tombstones. Compaction, schema
 migration, coordinator consensus and remote transports require separate designs.
+
+Journal lifecycle update (#19): the original deferral of compaction is superseded
+by the [checkpoint/retention contract](../journal-lifecycle.md). Permanent retry
+bindings and resource tombstones remain required; only covered event history can
+be discarded or archived.

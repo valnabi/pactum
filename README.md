@@ -91,8 +91,11 @@ fail closed. This is not protection against malicious database editing or a
 storage device that lies about synchronization. Process-kill tests do not emulate
 power loss on every filesystem or device.
 
-History and terminal tombstones are retained without compaction. Replay reads
-all history into memory. Work is sequential in deterministic ID order. There is
+Journal checkpoints compact or archive covered events while permanently retaining
+retry bindings, decisions and pending state. SQLite streams the remaining tail;
+`recover_pending` uses a pending-work index. See the
+[journal lifecycle guide](docs/journal-lifecycle.md) for APIs, crash guarantees,
+retention limits and replay benchmarks. Work is sequential in deterministic ID order. There is
 no consensus, active-active failover, remote transport, saga engine or automatic
 background recovery scheduler. Applications schedule subsequent recovery passes.
 See [architecture](docs/architecture.md) and [fault matrix](docs/fault-matrix.md).

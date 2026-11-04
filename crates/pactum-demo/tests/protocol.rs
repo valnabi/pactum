@@ -113,6 +113,9 @@ async fn durable_commit_abort_duplicates_identity_and_conflicting_input() {
     ));
     assert!(a.commit(&abort, b"abort").await.is_err());
     assert_eq!(a.value().await.unwrap(), 10);
+    coordinator
+        .compact(pactum_journal::Retention::Compact)
+        .unwrap();
     drop(coordinator);
     drop(a);
     drop(b);
@@ -133,6 +136,28 @@ async fn durable_commit_abort_duplicates_identity_and_conflicting_input() {
     );
     assert_eq!(a.value().await.unwrap(), 10);
     assert_eq!(b.value().await.unwrap(), 10);
+    assert!(matches!(
+        coordinator
+            .execute(tx(), enlist(&*a, &*b, true), &cancel)
+            .await,
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(
+        coordinator
+            .execute(tx(), enlist(&*a, &*b, false), &cancel)
+            .await
+            .unwrap()
+            .outcome,
+        Outcome::Committed
+    );
+    assert_eq!(
+        coordinator
+            .execute(abort, enlist(&*a, &*b, true), &cancel)
+            .await
+            .unwrap()
+            .outcome,
+        Outcome::Aborted
+    );
 }
 
 /// Journal failures both before persistence and after a successful barrier.
@@ -596,6 +621,17 @@ async fn reconcile_and_verify(path: &Path) {
     )
     .unwrap();
     let before = coordinator.status(&tx()).unwrap();
+    coordinator
+        .compact(pactum_journal::Retention::Archive)
+        .unwrap();
+    drop(coordinator);
+    let mut coordinator = Coordinator::open(
+        SqliteJournal::open(path.join("j.db")).unwrap(),
+        vec![a.clone(), b.clone()],
+        policy(),
+    )
+    .unwrap();
+    assert_eq!(before, coordinator.status(&tx()).unwrap());
     let after = coordinator.recover(&Cancellation::default()).await.unwrap();
     if let Some(before) = before {
         assert_eq!(after.len(), 1);
@@ -618,6 +654,16 @@ async fn reconcile_and_verify(path: &Path) {
         };
         assert_eq!(a.status(&tx()).await.unwrap(), state);
         assert_eq!(b.status(&tx()).await.unwrap(), state);
+        assert!(
+            coordinator
+                .recover_pending(&Cancellation::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        coordinator
+            .compact(pactum_journal::Retention::Compact)
+            .unwrap();
         assert_eq!(
             coordinator.recover(&Cancellation::default()).await.unwrap()[0],
             *after
@@ -796,4 +842,88 @@ async fn retry_after_lost_commit_response_changes_value_once() {
     assert_eq!(b.value().await.unwrap(), 10);
     assert_eq!(coordinator.diagnostics().pending_transactions, 0);
     assert!(!coordinator.diagnostics().reopen_required);
+}
+
+#[test]
+fn checkpoint_does_not_invent_commit_without_prepares_or_accept_duplicate_bindings() {
+    let begin = serde_json::json!({"kind":"Begin", "tx":"t", "requests":[{"participant":"a", "payload":[49]}]});
+    for records in [
+        serde_json::json!([begin, {"kind":"Decided", "tx":"t", "decision":"Commit"}]),
+        serde_json::json!([begin, begin]),
+        serde_json::json!([{"kind":"Acknowledged", "tx":"t", "participant":"a"}]),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut j = SqliteJournal::open(temp.path().join("j.db")).unwrap();
+        for _ in 0..10 {
+            j.append(1, b"covered").unwrap();
+        }
+        j.flush().unwrap();
+        j.compact(
+            10,
+            1,
+            &serde_json::to_vec(&records).unwrap(),
+            pactum_journal::Retention::Compact,
+        )
+        .unwrap();
+        assert!(Coordinator::open(j, vec![], policy()).is_err());
+    }
+}
+
+#[tokio::test]
+async fn uncertain_checkpoint_acknowledgement_requires_reopen_and_preserves_pending_commit() {
+    struct LostCheckpoint {
+        inner: SqliteJournal,
+        after_commit: bool,
+    }
+    impl Journal for LostCheckpoint {
+        fn append(&mut self, v: u32, p: &[u8]) -> Result<Sequence, JournalError> {
+            self.inner.append(v, p)
+        }
+        fn flush(&mut self) -> Result<Sequence, JournalError> {
+            self.inner.flush()
+        }
+        fn replay(&mut self) -> Result<Vec<Entry>, JournalError> {
+            self.inner.replay()
+        }
+        fn checkpoint(&mut self) -> Result<Option<pactum_journal::Checkpoint>, JournalError> {
+            self.inner.checkpoint()
+        }
+        fn compact(
+            &mut self,
+            w: Sequence,
+            v: u32,
+            p: &[u8],
+            r: pactum_journal::Retention,
+        ) -> Result<(), JournalError> {
+            if self.after_commit {
+                self.inner.compact(w, v, p, r)?;
+            }
+            Err(JournalError("lost checkpoint acknowledgement".into()))
+        }
+    }
+    for after_commit in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        seed_pending_commit(temp.path()).await;
+        let journal = LostCheckpoint {
+            inner: SqliteJournal::open(temp.path().join("j.db")).unwrap(),
+            after_commit,
+        };
+        let mut coordinator = Coordinator::open(journal, vec![], policy()).unwrap();
+        let before = coordinator.status(&tx()).unwrap();
+        assert!(matches!(
+            coordinator.compact(pactum_journal::Retention::Compact),
+            Err(Error::InDoubt(_))
+        ));
+        assert!(matches!(coordinator.status(&tx()), Err(Error::InDoubt(_))));
+        drop(coordinator);
+        let coordinator = Coordinator::open(
+            SqliteJournal::open(temp.path().join("j.db")).unwrap(),
+            vec![],
+            policy(),
+        )
+        .unwrap();
+        assert_eq!(before, coordinator.status(&tx()).unwrap());
+        drop(coordinator);
+        reconcile_and_verify(temp.path()).await;
+    }
 }
