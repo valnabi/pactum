@@ -96,8 +96,9 @@ retry bindings, decisions and pending state. SQLite streams the remaining tail;
 `recover_pending` uses a pending-work index. See the
 [journal lifecycle guide](docs/journal-lifecycle.md) for APIs, crash guarantees,
 retention limits and replay benchmarks. Work is sequential in deterministic ID order. There is
-no consensus, active-active failover, remote transport, saga engine or automatic
-background recovery scheduler. Applications schedule subsequent recovery passes.
+no consensus, active-active failover, remote transport or saga engine.
+An optional [recovery service](docs/recovery-service.md) schedules subsequent
+recovery passes with durable backoff, operator controls and observability.
 See [architecture](docs/architecture.md) and [fault matrix](docs/fault-matrix.md).
 
 ## Development

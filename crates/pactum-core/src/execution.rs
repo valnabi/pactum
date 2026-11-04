@@ -884,6 +884,50 @@ impl<J: Journal, B: Backend> Execution for Engine<J, B> {
     }
 }
 
+#[async_trait]
+impl<J: Journal, B: Backend> crate::recovery::RecoveryTarget for Engine<J, B> {
+    fn pending_work(&self) -> Result<Vec<crate::recovery::Work>, Error> {
+        self.healthy()?;
+        Ok(self
+            .pending
+            .iter()
+            .map(|id| crate::recovery::Work::Operation(self.snapshot(id)))
+            .collect())
+    }
+    fn replay_position(&self) -> u64 {
+        self.sequence
+    }
+    async fn recover_one(
+        &mut self,
+        key: &str,
+        cancellation: &Cancellation,
+    ) -> Result<crate::recovery::Work, Error> {
+        self.healthy()?;
+        let id = OperationId::new(key)?;
+        if !self.states.contains_key(&id) {
+            return Err(Error::Invalid("unknown operation".into()));
+        }
+        self.advance(&id, cancellation)
+            .map(crate::recovery::Work::Operation)
+    }
+    fn resume_work(&mut self, key: &str) -> Result<(), Error> {
+        self.healthy()?;
+        let id = OperationId::new(key)?;
+        if let Some(State {
+            progress: Progress::Chunked(mut s),
+            ..
+        }) = self.states.get(&id).cloned()
+            && s.paused
+            && !s.rejected
+            && !s.is_complete()
+        {
+            s.paused = false;
+            self.progress(&id, Progress::Chunked(s))?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

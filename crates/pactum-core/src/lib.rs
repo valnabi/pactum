@@ -931,3 +931,6 @@ mod tests {
 
 /// Multi-mode lifecycle, backend contracts, and 2PC compatibility.
 pub mod execution;
+
+/// Optional host-neutral recovery scheduling and operator controls.
+pub mod recovery;
