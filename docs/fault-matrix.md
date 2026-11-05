@@ -95,3 +95,12 @@ missing checkpoint/head/tail, staging and watermark mismatch, legacy migration,
 archive export, failed writes and lost compaction acknowledgements are covered.
 The protocol and multi-mode restart matrices also compact and reopen recovered
 prefixes before further dispatch. See [lifecycle invariants](journal-lifecycle.md).
+
+## Distributed ownership (#25)
+
+`pactum-distributed/tests/distributed.rs` covers competing owners/connections,
+expired and released grants, stale staged flush/compaction, delayed old-owner
+prepare and finalization, immutable request/response identity, partitions, lost
+replies, checkpoint takeover and real process death after prepare, durable decision
+and participant effects. Recovery never reverses a durable commit. See
+[ADR 0004](adr/0004-distributed-ownership.md) for enforcement assumptions.

@@ -18,6 +18,7 @@ is reported explicitly; recovery never reverses a recorded decision.
 | `pactum-journal` | Independent ordered byte journal and explicit durability barrier |
 | `pactum-sqlite` | SQLite WAL/FULL journal plus transactional receipt and publish reference backend |
 | `pactum-messaging` | Optional backend-neutral outbox/inbox contracts, dispatcher and fake transport |
+| `pactum-distributed` | Opt-in fenced 2PC ownership, durable reference authority and remote participant protocol |
 | `pactum-demo` | Durable 2PC counters, mode and Saga examples, and crash tests |
 
 Core depends on the journal contract, not SQLite or the demo. Journal has no
@@ -111,9 +112,21 @@ is unresolved. `Error::InDoubt` means a journal write may have persisted: drop t
 coordinator and journal, reopen, then recover. Do not issue a compensating abort.
 `diagnostics()` exposes durable-record, recovery-pass and pending-work counters.
 
+## Optional distributed 2PC
+
+The [distributed coordination guide](docs/distributed-coordination.md) describes
+opt-in lease/epoch authority, atomic fencing, safe shared-journal takeover and
+versioned remote participants. The SQLite authority and loopback transport are
+single-host reference implementations; production multi-host use requires an
+external durable authority and adapters enforcing the documented fencing contract.
+
+```sh
+cargo run -p pactum-distributed --example distributed -- ./distributed.db
+```
+
 ## Failure model and limitations
 
-This MVP assumes one coordinator owns the journal and all transaction decisions.
+The default local API assumes one coordinator owns the journal and all transaction decisions.
 The SQLite adapter enforces a same-path advisory owner lock, not distributed
 leadership fencing. Use local filesystems honoring SQLite locking and sync,
 retain journal and resource databases, and never modify them behind the engine.
@@ -135,7 +148,8 @@ retry bindings, decisions and pending state. SQLite streams the remaining tail;
 `recover_pending` uses a pending-work index. See the
 [journal lifecycle guide](docs/journal-lifecycle.md) for APIs, crash guarantees,
 retention limits and replay benchmarks. Mode/coordinator recovery visits keys in deterministic ID order. Plan steps use bounded concurrent DAG scheduling. There is
-no consensus, active-active failover or remote transport.
+no built-in consensus or active-active decision authority. The optional distributed
+crate adds fenced 2PC takeover and a remote transport contract.
 An optional [recovery service](docs/recovery-service.md) schedules subsequent
 recovery passes with durable backoff, operator controls and observability.
 See [architecture](docs/architecture.md) and [fault matrix](docs/fault-matrix.md).

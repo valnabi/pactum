@@ -154,3 +154,10 @@ It does not change the coordinator's decision rules. Ambiguous effects must be
 reconciled before compensation; permanent compensation failure and irreversible
 boundaries require explicit manual remediation. Compensation is not atomic
 rollback and a completed Saga is not an ACID commit. See [Saga contracts](sagas.md).
+
+## Optional distributed 2PC
+
+See [ADR 0004](adr/0004-distributed-ownership.md) and the
+[distributed guide](distributed-coordination.md). The separate optional crate
+requires enforceable grant validation at journal and participant effect boundaries;
+lease expiry alone never permits takeover of unfenced local resources.

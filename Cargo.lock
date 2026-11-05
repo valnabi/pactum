@@ -231,6 +231,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pactum-distributed"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "pactum-core",
+ "pactum-journal",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pactum-journal"
 version = "0.2.0"
 
