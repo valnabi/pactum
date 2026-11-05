@@ -174,3 +174,6 @@ no GitHub-hosted CI service is required.
 
 See the [structured error contract](error-handling.md) for stable codes,
 source/context propagation, safe retry guidance and migration details.
+
+The optional [transaction planner](transaction-planner.md) generates validated DAGs
+from declarative intent and frozen provider capabilities without executing work.

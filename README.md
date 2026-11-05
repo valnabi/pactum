@@ -63,6 +63,14 @@ plans do not provide global atomicity or rollback previously completed effects.
 cargo run -p pactum-demo --example transaction_plan -- ./transaction-plan-data
 ```
 
+## Optional transaction planning
+
+The [transaction planner guide](docs/transaction-planner.md) describes the public
+`TransactionPlanner` trait, default and custom planner selection, frozen provider
+capabilities, hard/soft budgets, deterministic partitioning, immutable accepted
+plans and dry-run inspection. Plans reuse the existing DAG engine and retain
+explicit native atomic, partial chunk, staged visibility or 2PC guarantees.
+
 ## Sagas for non-2PC resources
 
 The optional [Saga engine](docs/sagas.md) runs immutable forward operations and

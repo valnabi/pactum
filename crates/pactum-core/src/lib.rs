@@ -1252,3 +1252,6 @@ pub mod plan;
 
 /// Durable forward operations and explicit best-effort compensations.
 pub mod saga;
+
+/// Optional pure transaction planning over frozen provider capabilities.
+pub mod planner;
