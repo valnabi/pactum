@@ -2,6 +2,7 @@
 #[path = "../examples/support/plan.rs"]
 mod support;
 use async_trait::async_trait;
+use pactum_core::scheduler::*;
 use pactum_core::{Cancellation, Error, execution::*, plan::*};
 use pactum_journal::{Entry, Journal, JournalError, Sequence};
 use pactum_sqlite::{SqliteBackend, SqliteJournal};
@@ -434,7 +435,12 @@ impl StepAdapter for FaultAdapter {
         Ok(result)
     }
 }
-async fn attempt(directory: &Path, target: usize, kill: bool) -> usize {
+async fn attempt_with_scheduler(
+    directory: &Path,
+    target: usize,
+    kill: bool,
+    priority: bool,
+) -> usize {
     let fault = Fault {
         count: Arc::new(AtomicUsize::new(0)),
         target,
@@ -457,6 +463,13 @@ async fn attempt(directory: &Path, target: usize, kill: bool) -> usize {
         fault: fault.clone(),
     };
     if let Ok(mut e) = PlanEngine::open(journal, ns(), adapters, PlanPolicy::default()) {
+        if priority {
+            e.configure_scheduler(
+                Arc::new(PriorityFairScheduler::default()),
+                SchedulerLimits::default(),
+            )
+            .unwrap();
+        }
         for _ in 0..5 {
             match e.execute(support::spec(), &Cancellation::default()).await {
                 Ok(s) if s.is_terminal() => break,
@@ -494,12 +507,14 @@ async fn verify(directory: &Path) {
 }
 #[tokio::test]
 async fn lost_acknowledgements_at_every_plan_barrier_and_adapter_boundary() {
-    let baseline = tempfile::tempdir().unwrap();
-    let count = attempt(baseline.path(), 0, false).await;
-    for target in 1..=count {
-        let temp = tempfile::tempdir().unwrap();
-        attempt(temp.path(), target, false).await;
-        verify(temp.path()).await;
+    for priority in [false, true] {
+        let baseline = tempfile::tempdir().unwrap();
+        let count = attempt_with_scheduler(baseline.path(), 0, false, priority).await;
+        for target in 1..=count {
+            let temp = tempfile::tempdir().unwrap();
+            attempt_with_scheduler(temp.path(), target, false, priority).await;
+            verify(temp.path()).await;
+        }
     }
 }
 #[tokio::test]
@@ -511,28 +526,32 @@ async fn plan_crash_child() {
         .unwrap()
         .parse()
         .unwrap();
-    attempt(Path::new(&directory), target, true).await;
+    let priority = std::env::var("PACTUM_PLAN_PRIORITY").as_deref() == Ok("true");
+    attempt_with_scheduler(Path::new(&directory), target, true, priority).await;
     panic!("crash point was not reached");
 }
 #[tokio::test]
 async fn process_death_at_every_plan_barrier_and_adapter_boundary() {
-    let baseline = tempfile::tempdir().unwrap();
-    let count = attempt(baseline.path(), 0, false).await;
-    for target in 1..=count {
-        let temp = tempfile::tempdir().unwrap();
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "plan_crash_child", "--nocapture"])
-            .env("PACTUM_PLAN_PATH", temp.path())
-            .env("PACTUM_PLAN_TARGET", target.to_string())
-            .output()
-            .unwrap();
-        assert_eq!(
-            result.status.code(),
-            Some(86),
-            "target={target}: {}",
-            String::from_utf8_lossy(&result.stdout)
-        );
-        verify(temp.path()).await;
+    for priority in [false, true] {
+        let baseline = tempfile::tempdir().unwrap();
+        let count = attempt_with_scheduler(baseline.path(), 0, false, priority).await;
+        for target in 1..=count {
+            let temp = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "plan_crash_child", "--nocapture"])
+                .env("PACTUM_PLAN_PATH", temp.path())
+                .env("PACTUM_PLAN_TARGET", target.to_string())
+                .env("PACTUM_PLAN_PRIORITY", priority.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(86),
+                "target={target}: {}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            verify(temp.path()).await;
+        }
     }
 }
 
@@ -891,4 +910,509 @@ async fn classified_plan_failure_requires_durable_operator_authorization() {
         PlanOutcome::Complete
     );
     assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+}
+
+// Reusable policy contract: the same durable runner and fault boundaries apply
+// to built-in and externally implemented policies.
+struct ReversePolicy;
+impl TransactionScheduler for ReversePolicy {
+    fn select(&self, c: &SchedulingContext<'_>) -> Result<SchedulingDecision, Error> {
+        Ok(c.ready.last().map_or(SchedulingDecision::Defer, |s| {
+            SchedulingDecision::Dispatch(s.step.id.clone())
+        }))
+    }
+}
+async fn scheduler_contract(policy: Arc<dyn TransactionScheduler>) {
+    let temp = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let config = PlanPolicy {
+        concurrency: 8,
+        max_dispatches: 7,
+        ..Default::default()
+    };
+    let mut engine = probe_engine(temp.path(), probe.clone(), config.clone());
+    engine
+        .configure_scheduler(
+            policy.clone(),
+            SchedulerLimits {
+                pending_steps: 67,
+                per_plan_concurrency: 3,
+                per_adapter_concurrency: BTreeMap::from([(AdapterId::new("probe").unwrap(), 2)]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut steps: Vec<_> = (20..84)
+        .map(|i| step(&format!("s{i}"), &[], i, &[]))
+        .collect();
+    steps.push(step("scope-a", &[], 3, &["shared"]));
+    steps.push(step("scope-b", &[], 4, &["shared"]));
+    let deps: Vec<_> = steps.iter().map(|s| s.id.as_str()).collect();
+    let join = step("join", &deps, 100, &[]);
+    steps.push(join);
+    let spec = plan(steps);
+    let mut status = engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(probe.calls.lock().unwrap().len(), 7);
+    assert!(engine.scheduler_metrics().max_wait_rounds > 0);
+    assert_eq!(status.steps[&sid("join")].attempts, 0);
+    // Reopen with a smaller admission limit: bound work must still reconcile.
+    drop(engine);
+    let mut engine = probe_engine(temp.path(), probe.clone(), config);
+    engine
+        .configure_scheduler(
+            policy,
+            SchedulerLimits {
+                pending_steps: 1,
+                per_plan_concurrency: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for _ in 0..10 {
+        if status.is_terminal() {
+            break;
+        }
+        status = engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.outcome, PlanOutcome::Complete);
+    assert_eq!(engine.queued_steps(), 0);
+    assert!(probe.peak.load(Ordering::SeqCst) <= 2);
+    let calls = probe.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 67);
+    assert_eq!(calls.last(), Some(&100));
+    engine
+        .resume(&spec.id, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(probe.calls.lock().unwrap().len(), 67);
+}
+#[tokio::test]
+async fn scheduler_default_priority_and_external_contract_under_load() {
+    scheduler_contract(Arc::new(DefaultScheduler)).await;
+    scheduler_contract(Arc::new(PriorityFairScheduler::default())).await;
+    scheduler_contract(Arc::new(ReversePolicy)).await;
+}
+struct BrokenPolicy(u8);
+impl TransactionScheduler for BrokenPolicy {
+    fn select(&self, _: &SchedulingContext<'_>) -> Result<SchedulingDecision, Error> {
+        match self.0 {
+            0 => Ok(SchedulingDecision::Dispatch(sid("blocked"))),
+            1 => panic!("injected policy failure"),
+            2 => Err(Error::in_doubt("host quota unavailable".into())),
+            _ => Ok(SchedulingDecision::Defer),
+        }
+    }
+}
+#[tokio::test]
+async fn scheduler_invalid_error_panic_and_defer_never_create_attempts() {
+    for kind in 0..4 {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe::default());
+        let mut engine = probe_engine(temp.path(), probe.clone(), PlanPolicy::default());
+        engine
+            .configure_scheduler(Arc::new(BrokenPolicy(kind)), SchedulerLimits::default())
+            .unwrap();
+        let spec = plan(vec![
+            step("first", &[], 1, &[]),
+            step("blocked", &["first"], 2, &[]),
+        ]);
+        let result = engine.execute(spec.clone(), &Cancellation::default()).await;
+        assert_eq!(result.is_err(), kind < 3);
+        assert_eq!(
+            engine.scheduling_snapshot().unwrap().pending[&sid("first")],
+            if kind < 3 {
+                PendingReason::PolicyError
+            } else {
+                PendingReason::PolicyDeferred
+            }
+        );
+        assert_eq!(
+            engine.scheduling_snapshot().unwrap().pending[&sid("blocked")],
+            PendingReason::Dependencies
+        );
+        assert_eq!(
+            engine.scheduler_metrics().policy_errors,
+            u64::from(kind < 3)
+        );
+        assert!(probe.calls.lock().unwrap().is_empty());
+        assert!(
+            engine
+                .status(&spec.id)
+                .unwrap()
+                .unwrap()
+                .steps
+                .values()
+                .all(|s| s.attempts == 0)
+        );
+        drop(engine);
+        let mut engine = probe_engine(temp.path(), probe.clone(), PlanPolicy::default());
+        assert_eq!(
+            engine
+                .resume(&spec.id, &Cancellation::default())
+                .await
+                .unwrap()
+                .outcome,
+            PlanOutcome::Complete
+        );
+    }
+}
+#[tokio::test]
+async fn scheduler_queue_backpressure_quota_and_pause_are_non_durable() {
+    let temp = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let mut engine = probe_engine(temp.path(), probe.clone(), PlanPolicy::default());
+    let limits = SchedulerLimits {
+        pending_steps: 2,
+        resource_dispatch_quota: BTreeMap::from([("hot".into(), 1)]),
+        ..Default::default()
+    };
+    engine
+        .configure_scheduler(Arc::new(DefaultScheduler), limits)
+        .unwrap();
+    let control = engine.scheduler_control();
+    control.pause();
+    let spec = plan(vec![
+        step("a", &[], 1, &["hot"]),
+        step("b", &[], 2, &["hot"]),
+    ]);
+    engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(engine.queued_steps(), 2);
+    assert_eq!(
+        engine.scheduling_snapshot().unwrap().pending[&sid("a")],
+        PendingReason::Paused
+    );
+    assert!(probe.calls.lock().unwrap().is_empty());
+    let mut other = plan(vec![step("c", &[], 5, &[])]);
+    other.id = PlanId::new("other").unwrap();
+    let position = engine.replay_position();
+    assert!(
+        engine
+            .execute(other.clone(), &Cancellation::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.replay_position(), position);
+    assert!(engine.status(&other.id).unwrap().is_none());
+    assert_eq!(engine.scheduler_metrics().rejected, 1);
+    control.resume();
+    engine
+        .resume(&spec.id, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(probe.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        engine.scheduling_snapshot().unwrap().pending[&sid("b")],
+        PendingReason::ResourceQuota
+    );
+    assert_eq!(engine.queued_steps(), 1);
+    engine
+        .execute(other, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap()
+            .outcome,
+        PlanOutcome::Complete
+    );
+    assert_eq!(engine.scheduler_metrics().dispatched, 3);
+    assert_eq!(engine.scheduler_metrics().completed, 3);
+    assert!(engine.scheduler_metrics().dispatch_elapsed > Duration::ZERO);
+}
+#[tokio::test]
+async fn scheduler_priority_ages_across_passes_and_never_unlocks_dependencies() {
+    let temp = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let mut engine = probe_engine(
+        temp.path(),
+        probe.clone(),
+        PlanPolicy {
+            max_dispatches: 1,
+            ..Default::default()
+        },
+    );
+    engine
+        .configure_scheduler(
+            Arc::new(PriorityFairScheduler {
+                priorities: BTreeMap::from([(sid("retry"), 2), (sid("blocked"), i32::MAX)]),
+            }),
+            SchedulerLimits::default(),
+        )
+        .unwrap();
+    let spec = plan(vec![
+        step("retry", &[], 0, &[]),
+        step("low", &[], 1, &[]),
+        step("blocked", &["retry"], 2, &[]),
+    ]);
+    let mut status = engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        status = engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap();
+    }
+    assert!(status.steps[&sid("low")].is_success());
+    assert_eq!(status.steps[&sid("blocked")].attempts, 0);
+    assert_eq!(
+        probe
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|v| **v == 1)
+            .count(),
+        1
+    );
+    assert!(engine.scheduler_metrics().uncertain > 0);
+}
+struct DuplicatePolicy(Mutex<Option<StepId>>);
+impl TransactionScheduler for DuplicatePolicy {
+    fn select(&self, c: &SchedulingContext<'_>) -> Result<SchedulingDecision, Error> {
+        let mut selected = self.0.lock().unwrap();
+        let id = selected.get_or_insert_with(|| c.ready[0].step.id.clone());
+        Ok(SchedulingDecision::Dispatch(id.clone()))
+    }
+}
+#[tokio::test]
+async fn scheduler_duplicate_dispatch_fails_closed_and_reconciles_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let mut engine = probe_engine(temp.path(), probe.clone(), PlanPolicy::default());
+    engine
+        .configure_scheduler(
+            Arc::new(DuplicatePolicy(Mutex::new(None))),
+            SchedulerLimits::default(),
+        )
+        .unwrap();
+    let spec = plan(vec![step("a", &[], 1, &[]), step("b", &[], 2, &[])]);
+    assert!(
+        engine
+            .execute(spec.clone(), &Cancellation::default())
+            .await
+            .is_err()
+    );
+    let status = engine.status(&spec.id).unwrap().unwrap();
+    assert_eq!(status.steps[&sid("a")].attempts, 1);
+    assert_eq!(status.steps[&sid("b")].attempts, 0);
+    assert_eq!(engine.scheduler_metrics().policy_errors, 1);
+    // This current-thread runtime has not polled the spawned task yet. Even
+    // though no permit is held, replacing its semaphore budgets must be refused.
+    assert!(
+        engine
+            .configure_scheduler(Arc::new(DefaultScheduler), SchedulerLimits::default())
+            .is_err()
+    );
+    tokio::task::yield_now().await;
+    engine
+        .configure_scheduler(Arc::new(DefaultScheduler), SchedulerLimits::default())
+        .unwrap();
+    drop(engine);
+    tokio::task::yield_now().await;
+    let mut engine = probe_engine(temp.path(), probe, PlanPolicy::default());
+    assert_eq!(
+        engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap()
+            .outcome,
+        PlanOutcome::Complete
+    );
+}
+
+#[tokio::test]
+async fn scheduler_limits_survive_dropped_passes_and_pause_drains_active_calls() {
+    for (per_plan, per_adapter) in [(1, 4), (4, 1)] {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe::default());
+        let mut engine = probe_engine(temp.path(), probe.clone(), PlanPolicy::default());
+        engine
+            .configure_scheduler(
+                Arc::new(ReversePolicy),
+                SchedulerLimits {
+                    per_plan_concurrency: per_plan,
+                    per_adapter_concurrency: BTreeMap::from([(
+                        AdapterId::new("probe").unwrap(),
+                        per_adapter,
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // Equal probe scopes deliberately fail if adapter calls ever overlap.
+        let spec = plan(vec![step("a", &[], 99, &[]), step("b", &[], 99, &[])]);
+        let cancellation = Cancellation::default();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(30),
+                engine.execute(spec.clone(), &cancellation)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            engine
+                .resume(&spec.id, &cancellation)
+                .await
+                .unwrap()
+                .outcome,
+            PlanOutcome::Complete
+        );
+        assert_eq!(probe.peak.load(Ordering::SeqCst), 1);
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let mut engine = probe_engine(
+        temp.path(),
+        probe.clone(),
+        PlanPolicy {
+            concurrency: 1,
+            ..Default::default()
+        },
+    );
+    let control = engine.scheduler_control();
+    let spec = plan(vec![step("a", &[], 99, &[]), step("b", &[], 1, &[])]);
+    let cancellation = Cancellation::default();
+    let (result, _) = tokio::join!(engine.execute(spec.clone(), &cancellation), async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        control.pause();
+    });
+    let status = result.unwrap();
+    assert!(status.steps[&sid("a")].is_success());
+    assert_eq!(status.steps[&sid("b")].attempts, 0);
+    assert_eq!(
+        engine.scheduling_snapshot().unwrap().pending[&sid("b")],
+        PendingReason::Paused
+    );
+    control.resume();
+    assert_eq!(
+        engine
+            .resume(&spec.id, &cancellation)
+            .await
+            .unwrap()
+            .outcome,
+        PlanOutcome::Complete
+    );
+}
+
+struct FencedProbe {
+    owns: std::sync::atomic::AtomicBool,
+    calls: Mutex<Vec<OperationId>>,
+    effects: AtomicUsize,
+}
+#[async_trait]
+impl StepAdapter for FencedProbe {
+    fn identity(&self) -> String {
+        "fenced-probe-v1".into()
+    }
+    fn accepts(&self, _: &StepWork) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        key: OperationId,
+        _: StepWork,
+        _: &Cancellation,
+    ) -> Result<StepResult, Error> {
+        self.calls.lock().unwrap().push(key);
+        if !self.owns.load(Ordering::SeqCst) {
+            return Err(Error::operational(pactum_core::Diagnostic::message(
+                pactum_core::ErrorCode::StaleOwner,
+                "lease expired".into(),
+            )));
+        }
+        self.effects.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Native(Progress::Atomic(
+            AtomicStatus::Committed,
+        )))
+    }
+}
+#[tokio::test]
+async fn scheduler_cannot_bypass_fencing_or_recovery_operator_blocks() {
+    use pactum_core::recovery::RecoveryTarget;
+    let temp = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(FencedProbe {
+        owns: std::sync::atomic::AtomicBool::new(false),
+        calls: Mutex::new(Vec::new()),
+        effects: AtomicUsize::new(0),
+    });
+    let open = || {
+        let mut engine = PlanEngine::open(
+            SqliteJournal::open(temp.path().join("plan.db")).unwrap(),
+            ns(),
+            BTreeMap::from([(
+                AdapterId::new("probe").unwrap(),
+                adapter.clone() as Arc<dyn StepAdapter>,
+            )]),
+            PlanPolicy::default(),
+        )
+        .unwrap();
+        engine
+            .configure_scheduler(
+                Arc::new(PriorityFairScheduler {
+                    priorities: BTreeMap::from([(sid("b"), i32::MAX)]),
+                }),
+                SchedulerLimits::default(),
+            )
+            .unwrap();
+        engine
+    };
+    let mut engine = open();
+    let spec = plan(vec![step("a", &[], 1, &[]), step("b", &["a"], 2, &[])]);
+    engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.scheduling_snapshot().unwrap().pending[&sid("a")],
+        PendingReason::OperatorIntervention
+    );
+    assert_eq!(adapter.effects.load(Ordering::SeqCst), 0);
+    drop(engine);
+    let mut engine = open();
+    engine
+        .recover_one(spec.id.as_str(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(adapter.calls.lock().unwrap().len(), 1);
+    assert_eq!(
+        engine.status(&spec.id).unwrap().unwrap().steps[&sid("b")].attempts,
+        0
+    );
+    // Even explicit retry authorization cannot confer distributed authority.
+    engine.resume_work(spec.id.as_str()).unwrap();
+    engine
+        .recover_one(spec.id.as_str(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(adapter.calls.lock().unwrap().len(), 2);
+    assert_eq!(adapter.effects.load(Ordering::SeqCst), 0);
+    adapter.owns.store(true, Ordering::SeqCst);
+    engine.resume_work(spec.id.as_str()).unwrap();
+    engine
+        .recover_one(spec.id.as_str(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.status(&spec.id).unwrap().unwrap().outcome,
+        PlanOutcome::Complete
+    );
+    assert_eq!(adapter.effects.load(Ordering::SeqCst), 2);
+    let keys = adapter.calls.lock().unwrap();
+    assert_eq!(keys[0], keys[1]);
+    assert_eq!(keys[0], keys[2]);
+    assert_ne!(keys[2], keys[3]);
 }

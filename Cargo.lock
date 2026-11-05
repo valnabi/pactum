@@ -226,6 +226,7 @@ dependencies = [
  "sha2",
  "snafu",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

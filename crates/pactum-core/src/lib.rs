@@ -1255,3 +1255,6 @@ pub mod saga;
 
 /// Optional pure transaction planning over frozen provider capabilities.
 pub mod planner;
+
+/// Pluggable dispatch policies and engine-enforced admission budgets.
+pub mod scheduler;

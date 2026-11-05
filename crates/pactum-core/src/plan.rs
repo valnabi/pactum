@@ -4,6 +4,11 @@ use crate::execution::{
     AtomicStatus, Backend, Engine, Execution, Guarantees, Mode, OperationId, Progress,
     PublishStatus, Request,
 };
+use crate::scheduler::{
+    DefaultScheduler, PendingReason, ReadyStep, SchedulerControl, SchedulerLimits,
+    SchedulerMetrics, SchedulingContext, SchedulingDecision, SchedulingSnapshot,
+    TransactionScheduler,
+};
 use crate::{Cancellation, Coordinator, Decision, Enlistment, Error, Outcome, TransactionId};
 use async_trait::async_trait;
 use pactum_journal::Journal;
@@ -11,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -524,6 +532,23 @@ pub struct PlanEngine<J: Journal> {
     poisoned: bool,
     permits: Arc<Semaphore>,
     scopes: BTreeMap<String, Arc<Mutex<()>>>,
+    scheduler: Arc<dyn TransactionScheduler>,
+    limits: SchedulerLimits,
+    control: SchedulerControl,
+    metrics: SchedulerMetrics,
+    waits: BTreeMap<(PlanId, StepId), (u64, std::time::Instant)>,
+    snapshot: Option<SchedulingSnapshot>,
+    plan_permits: Arc<Semaphore>,
+    adapter_permits: BTreeMap<AdapterId, Arc<Semaphore>>,
+    live_tasks: Arc<AtomicUsize>,
+}
+// Count tasks from before spawn until destruction, including never-polled and
+// aborted futures. Checking only held permits races with a not-yet-polled task.
+struct DispatchGuard(Arc<AtomicUsize>);
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 impl<J: Journal> PlanEngine<J> {
     /// Replay without dispatch, rejecting corrupt history and foreign journals.
@@ -565,6 +590,15 @@ impl<J: Journal> PlanEngine<J> {
             poisoned: false,
             permits,
             scopes: BTreeMap::new(),
+            scheduler: Arc::new(DefaultScheduler),
+            limits: SchedulerLimits::default(),
+            control: SchedulerControl::default(),
+            metrics: SchedulerMetrics::default(),
+            waits: BTreeMap::new(),
+            snapshot: None,
+            plan_permits: Arc::new(Semaphore::new(1024)),
+            adapter_permits: BTreeMap::new(),
+            live_tasks: Arc::new(AtomicUsize::new(0)),
         };
         for entry in history {
             if entry.version != 4 || entry.sequence != engine.sequence + 1 {
@@ -590,6 +624,137 @@ impl<J: Journal> PlanEngine<J> {
             })?;
         }
         Ok(engine)
+    }
+    /// Replace the local dispatch policy and budgets without changing durable work.
+    /// Existing plans are never rejected by a smaller admission budget on resume.
+    pub fn configure_scheduler(
+        &mut self,
+        scheduler: Arc<dyn TransactionScheduler>,
+        limits: SchedulerLimits,
+    ) -> Result<(), Error> {
+        self.healthy()?;
+        if self.live_tasks.load(Ordering::SeqCst) != 0 {
+            return Err(Error::invalid(
+                "wait for interrupted adapter futures to drain before reconfiguring".into(),
+            ));
+        }
+        if limits.pending_steps == 0
+            || limits.per_plan_concurrency == 0
+            || limits.per_plan_concurrency > 1024
+            || limits
+                .per_adapter_concurrency
+                .values()
+                .any(|n| *n == 0 || *n > 1024)
+            || limits
+                .resource_dispatch_quota
+                .keys()
+                .any(|r| r.is_empty() || r.len() > 256 || r.chars().any(char::is_control))
+        {
+            return Err(Error::invalid("invalid scheduler limits".into()));
+        }
+        self.scheduler = scheduler;
+        self.plan_permits = Arc::new(Semaphore::new(limits.per_plan_concurrency));
+        self.adapter_permits = limits
+            .per_adapter_concurrency
+            .iter()
+            .map(|(id, n)| (id.clone(), Arc::new(Semaphore::new(*n))))
+            .collect();
+        self.limits = limits;
+        Ok(())
+    }
+    /// Clone the process-local pause/resume handle.
+    pub fn scheduler_control(&self) -> SchedulerControl {
+        self.control.clone()
+    }
+    /// Process-local counters; durable plan status remains the outcome authority.
+    pub fn scheduler_metrics(&self) -> &SchedulerMetrics {
+        &self.metrics
+    }
+    /// Advisory reasons from the latest scheduling boundary; never durable outcomes.
+    pub fn scheduling_snapshot(&self) -> Option<&SchedulingSnapshot> {
+        self.snapshot.as_ref()
+    }
+    /// Outstanding runnable or reconcilable steps, excluding terminal descendants.
+    pub fn queued_steps(&self) -> usize {
+        self.states
+            .values()
+            .map(|s| {
+                let failed = s.failed_dependencies();
+                s.steps
+                    .iter()
+                    .filter(|(id, step)| !step.terminal() && !failed.contains(*id))
+                    .count()
+            })
+            .sum()
+    }
+    fn scheduling_observation(
+        &self,
+        id: &PlanId,
+        cancellation: &Cancellation,
+        active: &BTreeMap<StepId, BTreeSet<String>>,
+        counts: &BTreeMap<StepId, usize>,
+        resource_dispatches: &BTreeMap<String, usize>,
+        dispatched: usize,
+    ) -> SchedulingSnapshot {
+        let state = &self.states[id];
+        let failed = state.failed_dependencies();
+        let used: BTreeSet<_> = active.values().flat_map(|s| s.iter().cloned()).collect();
+        let mut adapter_active: BTreeMap<_, usize> = BTreeMap::new();
+        for step in state
+            .spec
+            .steps
+            .iter()
+            .filter(|s| active.contains_key(&s.id))
+        {
+            *adapter_active.entry(&step.adapter).or_default() += 1;
+        }
+        let pending = state.spec.steps.iter().filter(|s| !state.steps[&s.id].terminal()).map(|s| {
+            let status = &state.steps[&s.id];
+            let reason = if active.contains_key(&s.id) {
+                PendingReason::Active
+            } else if failed.contains(&s.id) {
+                PendingReason::FailedDependencies
+            } else if !s.dependencies.iter().all(|d| state.steps[d].is_success()) {
+                PendingReason::Dependencies
+            } else if !status.retry_authorized && matches!(&status.report,
+                Some(Report::Operational(f)) if matches!(f.disposition,
+                    crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention)) {
+                PendingReason::OperatorIntervention
+            } else if cancellation.is_cancelled() {
+                PendingReason::Cancelled
+            } else if self.control.is_paused() {
+                PendingReason::Paused
+            } else if dispatched >= self.policy.max_dispatches
+                || counts.get(&s.id).copied().unwrap_or(0) >= self.policy.attempts_per_step {
+                PendingReason::PassBudget
+            } else if active.len() >= self.policy.concurrency.min(self.limits.per_plan_concurrency) {
+                PendingReason::Concurrency
+            } else if !s.resources.is_disjoint(&used) {
+                PendingReason::ResourceBusy
+            } else if s.resources.iter().any(|r| self.limits.resource_dispatch_quota.get(r)
+                .is_some_and(|quota| resource_dispatches.get(r).copied().unwrap_or(0) >= *quota)) {
+                PendingReason::ResourceQuota
+            } else if self.limits.per_adapter_concurrency.get(&s.adapter)
+                .is_some_and(|limit| adapter_active.get(&s.adapter).copied().unwrap_or(0) >= *limit) {
+                PendingReason::AdapterConcurrency
+            } else {
+                PendingReason::Eligible
+            };
+            (s.id.clone(), reason)
+        }).collect();
+        SchedulingSnapshot {
+            plan: id.clone(),
+            pending,
+        }
+    }
+    fn mark_policy_pending(&mut self, reason: PendingReason) {
+        if let Some(snapshot) = &mut self.snapshot {
+            for value in snapshot.pending.values_mut() {
+                if *value == PendingReason::Eligible {
+                    *value = reason;
+                }
+            }
+        }
     }
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
@@ -863,39 +1028,120 @@ impl<J: Journal> PlanEngine<J> {
             ));
         }
         if !self.states.contains_key(&spec.id) {
+            if spec.steps.len()
+                > self
+                    .limits
+                    .pending_steps
+                    .saturating_sub(self.queued_steps())
+            {
+                self.metrics.rejected = self.metrics.rejected.saturating_add(1);
+                return Err(Error::invalid(
+                    "scheduler queue capacity exceeded; retry admission later".into(),
+                ));
+            }
             self.persist(Record::Begin {
                 spec: spec.clone(),
                 bindings,
             })?;
+            self.metrics.admitted = self.metrics.admitted.saturating_add(1);
         }
         let fingerprint = spec.fingerprint()?;
         let mut tasks = JoinSet::new();
         let mut active: BTreeMap<StepId, BTreeSet<String>> = BTreeMap::new();
         let mut counts: BTreeMap<StepId, usize> = BTreeMap::new();
         let mut dispatched = 0;
+        let mut resource_dispatches: BTreeMap<String, usize> = BTreeMap::new();
+        let mut started = BTreeMap::new();
+        let mut policy_deferred = false;
         loop {
             while !cancellation.is_cancelled()
-                && tasks.len() < self.policy.concurrency
+                && !self.control.is_paused()
+                && tasks.len()
+                    < self
+                        .policy
+                        .concurrency
+                        .min(self.limits.per_plan_concurrency)
                 && dispatched < self.policy.max_dispatches
             {
+                self.snapshot = Some(self.scheduling_observation(
+                    &spec.id,
+                    cancellation,
+                    &active,
+                    &counts,
+                    &resource_dispatches,
+                    dispatched,
+                ));
                 let state = &self.states[&spec.id];
-                let used: BTreeSet<_> = active.values().flat_map(|s| s.iter().cloned()).collect();
-                let next = spec
+                let ready: Vec<_> = spec
                     .steps
                     .iter()
                     .filter(|s| {
-                        !active.contains_key(&s.id)
-                            && !state.steps[&s.id].terminal()
-                            && (state.steps[&s.id].retry_authorized || !matches!(&state.steps[&s.id].report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention)))
-                            && counts.get(&s.id).copied().unwrap_or(0)
-                                < self.policy.attempts_per_step
-                            && s.resources.is_disjoint(&used)
-                            && s.dependencies.iter().all(|d| state.steps[d].is_success())
+                        self.snapshot.as_ref().unwrap().pending.get(&s.id)
+                            == Some(&PendingReason::Eligible)
                     })
-                    .min_by_key(|s| (state.steps[&s.id].attempts, s.id.clone()))
-                    .cloned();
-                let Some(step) = next else {
+                    .map(|s| ReadyStep {
+                        step: s,
+                        attempts: state.steps[&s.id].attempts,
+                        wait_rounds: self
+                            .waits
+                            .get(&(spec.id.clone(), s.id.clone()))
+                            .map_or(0, |w| w.0),
+                        wait_duration: self
+                            .waits
+                            .get(&(spec.id.clone(), s.id.clone()))
+                            .map_or(Duration::ZERO, |w| w.1.elapsed()),
+                    })
+                    .collect();
+                if ready.is_empty() {
                     break;
+                }
+                policy_deferred = false;
+                let context = SchedulingContext {
+                    plan: &spec.id,
+                    ready: &ready,
+                    active: active.len(),
+                    remaining_dispatches: self.policy.max_dispatches - dispatched,
+                    metrics: &self.metrics,
+                };
+                let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.scheduler.select(&context)
+                }))
+                .unwrap_or_else(|_| Err(Error::invalid("scheduling policy panicked".into())));
+                // Aging is engine-owned and bounded by retained unfinished steps.
+                for candidate in &ready {
+                    let wait = self
+                        .waits
+                        .entry((spec.id.clone(), candidate.step.id.clone()))
+                        .or_insert_with(|| (0, std::time::Instant::now()));
+                    wait.0 = wait.0.saturating_add(1);
+                    self.metrics.max_wait_rounds = self.metrics.max_wait_rounds.max(wait.0);
+                    self.metrics.max_wait_duration =
+                        self.metrics.max_wait_duration.max(wait.1.elapsed());
+                }
+                let step = match decision {
+                    Ok(SchedulingDecision::Dispatch(id)) => {
+                        match ready.iter().find(|s| s.step.id == id) {
+                            Some(s) => s.step.clone(),
+                            None => {
+                                self.metrics.policy_errors =
+                                    self.metrics.policy_errors.saturating_add(1);
+                                self.mark_policy_pending(PendingReason::PolicyError);
+                                return Err(Error::invalid(
+                                    "policy selected an ineligible step".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(SchedulingDecision::Defer) => {
+                        self.metrics.deferred = self.metrics.deferred.saturating_add(1);
+                        policy_deferred = true;
+                        break;
+                    }
+                    Err(error) => {
+                        self.metrics.policy_errors = self.metrics.policy_errors.saturating_add(1);
+                        self.mark_policy_pending(PendingReason::PolicyError);
+                        return Err(error);
+                    }
                 };
                 let previous = state.steps[&step.id].attempts;
                 let attempt = previous
@@ -906,6 +1152,13 @@ impl<J: Journal> PlanEngine<J> {
                     step: step.id.clone(),
                     attempt,
                 })?;
+                self.waits.remove(&(spec.id.clone(), step.id.clone()));
+                started.insert(step.id.clone(), std::time::Instant::now());
+                self.metrics.dispatched = self.metrics.dispatched.saturating_add(1);
+                for resource in &step.resources {
+                    *resource_dispatches.entry(resource.clone()).or_default() += 1;
+                }
+                tracing::debug!(plan = %spec.id, step = %step.id, attempt, "scheduler dispatch");
                 active.insert(step.id.clone(), step.resources.clone());
                 *counts.entry(step.id.clone()).or_default() += 1;
                 dispatched += 1;
@@ -929,6 +1182,8 @@ impl<J: Journal> PlanEngine<J> {
                     Duration::ZERO
                 };
                 let permits = self.permits.clone();
+                let plan_permits = self.plan_permits.clone();
+                let adapter_permits = self.adapter_permits.get(&step.adapter).cloned();
                 let scopes: Vec<_> = step
                     .resources
                     .iter()
@@ -940,7 +1195,10 @@ impl<J: Journal> PlanEngine<J> {
                     })
                     .collect();
                 let plan_id = spec.id.clone();
+                self.live_tasks.fetch_add(1, Ordering::SeqCst);
+                let dispatch_guard = DispatchGuard(self.live_tasks.clone());
                 tasks.spawn(async move {
+                    let _dispatch_guard = dispatch_guard;
                     let context = crate::ErrorContext { transaction: Some(plan_id.as_str().into()), step: Some(step.id.as_str().into()), phase: Some("plan_step".into()), ..Default::default() };
                     let call = async {
                         // Guards survive a dropped execution future until its aborted
@@ -949,6 +1207,11 @@ impl<J: Journal> PlanEngine<J> {
                             .acquire_owned()
                             .await
                             .expect("private semaphore remains open");
+                        let _plan_permit = plan_permits.acquire_owned().await.expect("private semaphore remains open");
+                        let _adapter_permit = match adapter_permits {
+                            Some(permits) => Some(permits.acquire_owned().await.expect("private semaphore remains open")),
+                            None => None,
+                        };
                         let mut guards = Vec::new();
                         for scope in scopes {
                             guards.push(scope.lock_owned().await);
@@ -983,12 +1246,23 @@ impl<J: Journal> PlanEngine<J> {
             }
             match tasks.join_next().await.expect("nonempty task set") {
                 Ok((step, attempt, report, diagnostic)) => {
+                    let uncertain = matches!(report, Report::Uncertain(_) | Report::Operational(_));
                     self.persist(Record::Report {
                         plan: spec.id.clone(),
                         step: step.clone(),
                         attempt,
                         report,
                     })?;
+                    self.metrics.completed = self.metrics.completed.saturating_add(1);
+                    if uncertain {
+                        self.metrics.uncertain = self.metrics.uncertain.saturating_add(1);
+                    }
+                    if let Some(start) = started.remove(&step) {
+                        self.metrics.dispatch_elapsed = self
+                            .metrics
+                            .dispatch_elapsed
+                            .saturating_add(start.elapsed());
+                    }
                     self.states
                         .get_mut(&spec.id)
                         .unwrap()
@@ -1022,6 +1296,14 @@ impl<J: Journal> PlanEngine<J> {
                             attempt,
                             report,
                         })?;
+                        self.metrics.completed = self.metrics.completed.saturating_add(1);
+                        self.metrics.uncertain = self.metrics.uncertain.saturating_add(1);
+                        if let Some(start) = started.remove(step) {
+                            self.metrics.dispatch_elapsed = self
+                                .metrics
+                                .dispatch_elapsed
+                                .saturating_add(start.elapsed());
+                        }
                         self.states
                             .get_mut(&spec.id)
                             .unwrap()
@@ -1030,10 +1312,30 @@ impl<J: Journal> PlanEngine<J> {
                             .unwrap()
                             .diagnostic = local;
                     }
+                    active.clear();
                     break;
                 }
             }
         }
+        self.snapshot = Some(self.scheduling_observation(
+            &spec.id,
+            cancellation,
+            &active,
+            &counts,
+            &resource_dispatches,
+            dispatched,
+        ));
+        if policy_deferred {
+            self.mark_policy_pending(PendingReason::PolicyDeferred);
+        }
+        // Retain aging only for pending steps; failed descendants cannot reenter.
+        let pending = &self.snapshot.as_ref().unwrap().pending;
+        self.waits.retain(|(plan, step), _| {
+            plan != &spec.id
+                || pending
+                    .get(step)
+                    .is_some_and(|r| *r != PendingReason::FailedDependencies)
+        });
         self.status(&spec.id)?
             .ok_or_else(|| Error::corrupt("plan disappeared".into()))
     }

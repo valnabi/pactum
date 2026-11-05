@@ -108,6 +108,12 @@ kill testing does not simulate every filesystem's power-loss behavior.
 
 ## Scheduling, cancellation and partial failures
 
+The [scheduler policy guide](transaction-scheduler.md) describes the optional
+`TransactionScheduler` / `SchedulingPolicy` seam, default and priority-aging
+implementations, queue admission, adapter/plan limits, resource quotas, local pause
+controls and pending-reason diagnostics. All dispatches retain the existing
+dependency, durability, cancellation and receipt checks.
+
 `PlanPolicy` bounds concurrency, total dispatches per pass, attempts per step per
 pass, cooperative timeout and retry backoff. All bounds except backoff must be
 positive; concurrency is limited to 1024. Ready steps are selected by fewest durable attempts, then step ID.

@@ -65,6 +65,10 @@ cargo run -p pactum-demo --example transaction_plan -- ./transaction-plan-data
 
 ## Optional transaction planning
 
+The [transaction scheduler guide](docs/transaction-scheduler.md) describes pluggable
+dispatch policies, priority aging, queue admission, concurrency and resource quotas,
+pause controls and scheduling diagnostics in the existing durable DAG runner.
+
 The [transaction planner guide](docs/transaction-planner.md) describes the public
 `TransactionPlanner` trait, default and custom planner selection, frozen provider
 capabilities, hard/soft budgets, deterministic partitioning, immutable accepted
