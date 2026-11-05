@@ -6,6 +6,7 @@ Implemented for [epic #1](https://github.com/valnabi/pactum/issues/1).
 
 ```text
 application -> pactum-core -> pactum-journal
+core + journal + adapters -> pactum-errors (codes, context and SNAFU sources)
 application -> pactum-sqlite -> pactum-journal
 pactum-demo -> core + sqlite (example consumer and resource adapters)
 ```
@@ -68,8 +69,9 @@ can block the resource indefinitely.
 Participant operations are asynchronous and object-safe through `async_trait`.
 Tokio applies a configurable per-attempt timeout, bounded attempt count, and fixed
 retry backoff (defaults: 5 seconds, 3 attempts, 25 milliseconds). Prepare rejection
-is a vote and is not retried; transport errors and timeouts are retried. Finalize
-errors retain the durable decision and pending identity for later recovery.
+is a vote and is not retried; transient/ambiguous calls have bounded identical-key
+reconciliation attempts. Permanent and operator failures stop the attempt loop.
+Finalize errors retain the durable decision and pending identity for later recovery.
 
 Cancellation before the decision chooses abort; a cancelled execution stops
 finalization and returns pending status. Cancellation after a durable commit
@@ -161,3 +163,11 @@ See [ADR 0004](adr/0004-distributed-ownership.md) and the
 [distributed guide](distributed-coordination.md). The separate optional crate
 requires enforceable grant validation at journal and participant effect boundaries;
 lease expiry alone never permits takeover of unfenced local resources.
+
+## Structured errors
+
+See the [public error contract](error-handling.md) for the SNAFU hierarchy,
+stable codes, source chains and phase-aware retry/decision guidance added by
+epic #51. `Status::transaction_outcome()` distinguishes pending delivery of a
+known decision from unknown transaction state. Local diagnostics, durable
+recovery guidance and authoritative protocol results have separate roles.

@@ -98,8 +98,8 @@ command draining prevents a query flood from starving recovery.
 | Observation | Runner behavior |
 | --- | --- |
 | Resource unavailable or ambiguous resource response | Preserve typed protocol uncertainty; retain error and back off |
-| `Error::Invalid` from per-key recovery | Persist `Reason::Permanent`; require operator retry/resume after repair |
-| `Error::Corrupt` | Stop and report the error through the join result |
+| Permanent/manual classified failure | Persist stable `Schedule::failure` metadata and `Reason::Permanent`; require explicit repair/retry/resume |
+| Corrupt history or stale authority | Stop and report the typed error through the join result |
 | `Error::InDoubt` from either journal | Stop all dispatch immediately; drop handles/owners, reopen and replay |
 | Native chunk pause | Persist `ProtocolPaused`; wait for explicit resume |
 | Terminal protocol result | Remove scheduling state; preserve all protocol retry bindings/receipts |
@@ -158,3 +158,17 @@ reversal, native pause/resume across owner restart, uncertain protocol barriers
 and receipt reconciliation, and child-process exits after every scheduling
 append/flush for Atomic, Chunked and StagedPublish. Existing protocol boundary
 crash tests continue to validate the transaction authority independently.
+
+## Structured failure metadata
+
+The [error contract](error-handling.md) defines `ErrorCode`, `RetryContext` and
+`RetryDisposition`. The runner uses those codes and protocol state; it never
+parses diagnostic display strings. `Schedule::failure` persists safe code,
+disposition and correlation fields, with backward-compatible reading of older
+schedules that omit it. Original source chains remain process-local.
+
+For manually blocked plan steps, operator `Resume` records a durable retry
+authorization using the existing receipt keys. Saga `Resume` retains unknown
+effects while renewing its bounded reconciliation budget. A plain scheduled
+`Retry` cannot erase either protocol's manual block. Durable transaction decisions
+remain unchanged under every control.

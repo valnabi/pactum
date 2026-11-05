@@ -163,3 +163,15 @@ process-failure tests, not simulations of storage devices lying about sync.
 SQLite storage requires a local filesystem honoring WAL locking and FULL sync.
 Retain resource files and prevent replacement while workers are active. No
 consensus, cross-database transactions or distributed leader election is added.
+
+## Messaging error classification
+
+See the [structured error contract](error-handling.md) for stable codes,
+source/context propagation, safe retry guidance and migration details.
+
+Outbox `Delivery::failure` contains the last stable error code, retry disposition
+and safe correlation metadata, including timeout uncertainty and exhausted-budget
+intervention. It survives reopening without persisting source text. SQLite
+messaging schema v2 migrates v1 atomically on open; retained envelopes, receipts,
+ordering data and attempts are unchanged. Existing rows have `failure: None`.
+Update readers/writers together because older binaries reject schema v2.

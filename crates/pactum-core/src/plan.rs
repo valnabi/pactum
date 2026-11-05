@@ -84,20 +84,20 @@ impl TransactionPlan {
             || self.steps.is_empty()
             || self.steps.len() > 1024
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "unsupported, empty or oversized plan".into(),
             ));
         }
         if serde_json::to_vec(self)
-            .map_err(|e| Error::Invalid(e.to_string()))?
+            .map_err(Error::invalid_source)?
             .len()
             > 16 * 1024 * 1024
         {
-            return Err(Error::Invalid("plan exceeds 16 MiB".into()));
+            return Err(Error::invalid("plan exceeds 16 MiB".into()));
         }
         let steps: BTreeMap<_, _> = self.steps.iter().map(|s| (s.id.clone(), s)).collect();
         if steps.len() != self.steps.len() {
-            return Err(Error::Invalid("duplicate step ID".into()));
+            return Err(Error::invalid("duplicate step ID".into()));
         }
         for s in &self.steps {
             if s.dependencies.iter().any(|d| !steps.contains_key(d))
@@ -105,7 +105,7 @@ impl TransactionPlan {
                     .iter()
                     .any(|r| r.is_empty() || r.len() > 256 || r.chars().any(char::is_control))
             {
-                return Err(Error::Invalid(
+                return Err(Error::invalid(
                     "unknown dependency or invalid resource scope".into(),
                 ));
             }
@@ -134,20 +134,19 @@ impl TransactionPlan {
     pub fn fingerprint(&self) -> Result<String, Error> {
         let spec = self.clone().canonical()?;
         Ok(crate::sha256_hex(
-            serde_json::to_vec(&spec).map_err(|e| Error::Invalid(e.to_string()))?,
+            serde_json::to_vec(&spec).map_err(Error::invalid_source)?,
         ))
     }
     /// Namespace-independent receipt seed shared by every attempt of a step.
     /// The engine hashes this with its deployment namespace for the backend key.
     pub fn operation_key(&self, step: &StepId) -> Result<OperationId, Error> {
         if !self.steps.iter().any(|s| &s.id == step) {
-            return Err(Error::Invalid("unknown step".into()));
+            return Err(Error::invalid("unknown step".into()));
         }
         Self::receipt_seed(&self.fingerprint()?, step)
     }
     fn receipt_seed(fingerprint: &str, step: &StepId) -> Result<OperationId, Error> {
-        let bytes =
-            serde_json::to_vec(&(fingerprint, step)).map_err(|e| Error::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(&(fingerprint, step)).map_err(Error::invalid_source)?;
         OperationId::new(format!("plan-v1-{}", crate::sha256_hex(bytes)))
     }
 }
@@ -159,14 +158,14 @@ pub(crate) fn dependency_order<'a>(
     let mut graph = BTreeMap::new();
     for (id, dependencies) in steps {
         if graph.insert(id, dependencies).is_some() {
-            return Err(Error::Invalid("duplicate step ID".into()));
+            return Err(Error::invalid("duplicate step ID".into()));
         }
     }
     if graph
         .values()
         .any(|deps| deps.iter().any(|d| !graph.contains_key(d)))
     {
-        return Err(Error::Invalid("unknown dependency".into()));
+        return Err(Error::invalid("unknown dependency".into()));
     }
     let mut done = BTreeSet::new();
     let mut order = Vec::new();
@@ -175,7 +174,7 @@ pub(crate) fn dependency_order<'a>(
             .iter()
             .find(|(id, deps)| !done.contains(**id) && deps.is_subset(&done));
         let Some((id, _)) = next else {
-            return Err(Error::Invalid("dependency cycle".into()));
+            return Err(Error::invalid("dependency cycle".into()));
         };
         done.insert((*id).clone());
         order.push((*id).clone());
@@ -236,7 +235,7 @@ impl StepResult {
         if valid {
             Ok(())
         } else {
-            Err(Error::Corrupt("adapter result does not match step".into()))
+            Err(Error::corrupt("adapter result does not match step".into()))
         }
     }
 }
@@ -247,6 +246,8 @@ pub enum Report {
     Result(StepResult),
     /// Timeout, dropped call, adapter error or panic; retry the same receipt key.
     Uncertain(String),
+    /// Failed operational call, with no confirmed protocol outcome.
+    Operational(pactum_errors::FailureMetadata),
 }
 /// Durable per-step progress.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +256,12 @@ pub struct StepStatus {
     pub attempts: u64,
     /// None with attempts > 0 means an interrupted/running attempt.
     pub report: Option<Report>,
+    /// Process-local source chain. Durable guidance is carried by Report::Operational.
+    #[serde(skip)]
+    pub diagnostic: Option<pactum_errors::Diagnostic>,
+    /// Explicit operator authorization, consumed by the next attempt.
+    #[serde(default)]
+    pub retry_authorized: bool,
 }
 impl StepStatus {
     /// Successful durable prerequisite acknowledgement.
@@ -372,7 +379,7 @@ impl<J: Journal, B: Backend> StepAdapter for NativeAdapter<J, B> {
         cancellation: &Cancellation,
     ) -> Result<StepResult, Error> {
         let StepWork::Native(request) = work else {
-            return Err(Error::Invalid("native adapter requires native work".into()));
+            return Err(Error::invalid("native adapter requires native work".into()));
         };
         Ok(StepResult::Native(
             self.engine
@@ -419,7 +426,7 @@ impl<J: Journal> StepAdapter for TwoPhaseAdapter<J> {
         cancellation: &Cancellation,
     ) -> Result<StepResult, Error> {
         let StepWork::TwoPhase(requests) = work else {
-            return Err(Error::Invalid("2PC adapter requires enlistments".into()));
+            return Err(Error::invalid("2PC adapter requires enlistments".into()));
         };
         let s = self
             .coordinator
@@ -479,12 +486,30 @@ enum Record {
         step: StepId,
         attempt: u64,
     },
+    Retry {
+        plan: PlanId,
+        step: StepId,
+        reason: String,
+    },
     Report {
         plan: PlanId,
         step: StepId,
         attempt: u64,
         report: Report,
     },
+}
+fn failure_report(
+    error: Error,
+    context: crate::ErrorContext,
+) -> (Report, Option<crate::Diagnostic>) {
+    let diagnostic = error.diagnostic().clone().with_context(context);
+    diagnostic.trace();
+    let metadata = diagnostic.metadata(crate::RetryContext {
+        authority_valid: true,
+        idempotent: true,
+        ..Default::default()
+    });
+    (Report::Operational(metadata), Some(diagnostic))
 }
 /// Single-owner plan journal and bounded scheduler. Use a dedicated journal
 /// (record schema 4), separate from mode/coordinator/recovery-service journals.
@@ -515,20 +540,20 @@ impl<J: Journal> PlanEngine<J> {
             || policy.max_dispatches == 0
             || policy.timeout.is_zero()
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "positive plan scheduling bounds required".into(),
             ));
         }
         if journal
             .checkpoint()
-            .map_err(|e| Error::Corrupt(e.to_string()))?
+            .map_err(|source| Error::journal_read(source, "checkpoint"))?
             .is_some()
         {
-            return Err(Error::Corrupt("plan checkpoints are unsupported".into()));
+            return Err(Error::corrupt("plan checkpoints are unsupported".into()));
         }
         let history = journal
             .replay()
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+            .map_err(|source| Error::journal_read(source, "replay"))?;
         let permits = Arc::new(Semaphore::new(policy.concurrency));
         let mut engine = Self {
             journal,
@@ -543,16 +568,16 @@ impl<J: Journal> PlanEngine<J> {
         };
         for entry in history {
             if entry.version != 4 || entry.sequence != engine.sequence + 1 {
-                return Err(Error::Corrupt(
+                return Err(Error::corrupt(
                     "invalid plan record version/sequence".into(),
                 ));
             }
-            let r: Record = serde_json::from_slice(&entry.payload)
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            let r: Record =
+                serde_json::from_slice(&entry.payload).map_err(Error::corrupt_source)?;
             if engine.sequence == 0 {
                 if !matches!(r, Record::Header { ref namespace } if namespace == &engine.namespace)
                 {
-                    return Err(Error::Corrupt("foreign plan namespace/header".into()));
+                    return Err(Error::corrupt("foreign plan namespace/header".into()));
                 }
             } else {
                 engine.apply(&r)?;
@@ -568,7 +593,7 @@ impl<J: Journal> PlanEngine<J> {
     }
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
-            Err(Error::InDoubt(
+            Err(Error::in_doubt(
                 "drop and reopen plan engine after journal uncertainty".into(),
             ))
         } else {
@@ -576,7 +601,7 @@ impl<J: Journal> PlanEngine<J> {
         }
     }
     fn apply(&mut self, record: &Record) -> Result<(), Error> {
-        let corrupt = || Error::Corrupt("illegal plan journal transition".into());
+        let corrupt = || Error::corrupt("illegal plan journal transition".into());
         match record {
             Record::Header { .. } => return Err(corrupt()),
             Record::Begin { spec, bindings } => {
@@ -603,6 +628,8 @@ impl<J: Journal> PlanEngine<J> {
                                     StepStatus {
                                         attempts: 0,
                                         report: None,
+                                        diagnostic: None,
+                                        retry_authorized: false,
                                     },
                                 )
                             })
@@ -633,8 +660,27 @@ impl<J: Journal> PlanEngine<J> {
                 if s.terminal() || s.attempts.checked_add(1) != Some(*attempt) {
                     return Err(corrupt());
                 }
+                if !s.retry_authorized
+                    && matches!(&s.report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention))
+                {
+                    return Err(corrupt());
+                }
                 s.attempts = *attempt;
+                s.retry_authorized = false;
                 s.report = None;
+                s.diagnostic = None;
+            }
+            Record::Retry { plan, step, reason } => {
+                let state = self.states.get_mut(plan).ok_or_else(corrupt)?;
+                let step = state.steps.get_mut(step).ok_or_else(corrupt)?;
+                if reason.is_empty()
+                    || reason.len() > 4096
+                    || step.retry_authorized
+                    || !matches!(&step.report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention))
+                {
+                    return Err(corrupt());
+                }
+                step.retry_authorized = true;
             }
             Record::Report {
                 plan,
@@ -652,6 +698,9 @@ impl<J: Journal> PlanEngine<J> {
                 if let Report::Result(r) = report {
                     r.validate(&spec.work)?;
                 }
+                if matches!(report, Report::Operational(f) if !f.is_valid()) {
+                    return Err(corrupt());
+                }
                 let s = state.steps.get_mut(step).ok_or_else(corrupt)?;
                 if *attempt == 0 || s.attempts != *attempt || s.report.is_some() {
                     return Err(corrupt());
@@ -663,18 +712,40 @@ impl<J: Journal> PlanEngine<J> {
     }
     fn write(&mut self, record: &Record) -> Result<(), Error> {
         self.healthy()?;
-        let bytes = serde_json::to_vec(record).map_err(|e| Error::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(record).map_err(Error::invalid_source)?;
+        let context = match record {
+            Record::Header { namespace } => crate::ErrorContext {
+                transaction: Some(namespace.as_str().into()),
+                phase: Some("plan_header".into()),
+                ..Default::default()
+            },
+            Record::Begin { spec, .. } => crate::ErrorContext {
+                transaction: Some(spec.id.as_str().into()),
+                phase: Some("plan_begin".into()),
+                ..Default::default()
+            },
+            Record::Attempt { plan, step, .. }
+            | Record::Report { plan, step, .. }
+            | Record::Retry { plan, step, .. } => crate::ErrorContext {
+                transaction: Some(plan.as_str().into()),
+                step: Some(step.as_str().into()),
+                phase: Some("plan_journal".into()),
+                ..Default::default()
+            },
+        };
         self.poisoned = true;
-        let sequence = self
-            .journal
-            .append(4, &bytes)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
-        let durable = self
-            .journal
-            .flush()
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        let sequence = self.journal.append(4, &bytes).map_err(|e| {
+            let error = Error::journal(e, "append").with_context(context.clone());
+            error.trace();
+            error
+        })?;
+        let durable = self.journal.flush().map_err(|e| {
+            let error = Error::journal(e, "flush").with_context(context.clone());
+            error.trace();
+            error
+        })?;
         if self.sequence.checked_add(1) != Some(sequence) || durable != sequence {
-            return Err(Error::InDoubt("plan barrier did not cover record".into()));
+            return Err(Error::in_doubt("plan barrier did not cover record".into()));
         }
         self.sequence = sequence;
         self.poisoned = false;
@@ -702,7 +773,11 @@ impl<J: Journal> PlanEngine<J> {
                     PlanOutcome::Complete
                 } else if s.steps.values().any(|s| {
                     s.attempts > 0
-                        && (s.report.is_none() || matches!(s.report, Some(Report::Uncertain(_))))
+                        && (s.report.is_none()
+                            || matches!(
+                                s.report,
+                                Some(Report::Uncertain(_) | Report::Operational(_))
+                            ))
                 }) {
                     PlanOutcome::Indeterminate
                 } else if s.steps.values().any(|s| s.terminal() && !s.is_success()) {
@@ -740,7 +815,7 @@ impl<J: Journal> PlanEngine<J> {
             .get(id)
             .and_then(|s| s.spec.steps.iter().find(|s| &s.id == step))
             .map(|s| s.work.mode().guarantees())
-            .ok_or_else(|| Error::Invalid("unknown plan step".into()))
+            .ok_or_else(|| Error::invalid("unknown plan step".into()))
     }
     /// Bind or resume immutable work. Cancellation stops dispatch and drops
     /// outstanding cooperative calls as uncertain; a fresh token resumes them.
@@ -756,7 +831,7 @@ impl<J: Journal> PlanEngine<J> {
         if let Some(old) = self.states.get(&spec.id)
             && old.spec != spec
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "plan ID reused with changed revision, steps or payloads".into(),
             ));
         }
@@ -766,7 +841,7 @@ impl<J: Journal> PlanEngine<J> {
                 .get(&s.adapter)
                 .is_some_and(|a| a.accepts(&s.work))
             {
-                return Err(Error::Invalid(format!(
+                return Err(Error::invalid(format!(
                     "missing/incompatible adapter {}",
                     s.adapter
                 )));
@@ -778,12 +853,12 @@ impl<J: Journal> PlanEngine<J> {
             .map(|s| (s.adapter.clone(), self.adapters[&s.adapter].identity()))
             .collect();
         if bindings.values().any(|v| v.is_empty() || v.len() > 65536) {
-            return Err(Error::Invalid("invalid adapter resource identity".into()));
+            return Err(Error::invalid("invalid adapter resource identity".into()));
         }
         if let Some(old) = self.states.get(&spec.id)
             && old.bindings != bindings
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "adapter resource incarnation changed".into(),
             ));
         }
@@ -811,6 +886,7 @@ impl<J: Journal> PlanEngine<J> {
                     .filter(|s| {
                         !active.contains_key(&s.id)
                             && !state.steps[&s.id].terminal()
+                            && (state.steps[&s.id].retry_authorized || !matches!(&state.steps[&s.id].report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention)))
                             && counts.get(&s.id).copied().unwrap_or(0)
                                 < self.policy.attempts_per_step
                             && s.resources.is_disjoint(&used)
@@ -824,7 +900,7 @@ impl<J: Journal> PlanEngine<J> {
                 let previous = state.steps[&step.id].attempts;
                 let attempt = previous
                     .checked_add(1)
-                    .ok_or_else(|| Error::Invalid("step attempt counter exhausted".into()))?;
+                    .ok_or_else(|| Error::invalid("step attempt counter exhausted".into()))?;
                 self.persist(Record::Attempt {
                     plan: spec.id.clone(),
                     step: step.id.clone(),
@@ -842,7 +918,7 @@ impl<J: Journal> PlanEngine<J> {
                             self.namespace.as_str(),
                             TransactionPlan::receipt_seed(&fingerprint, &step.id)?.as_str()
                         ))
-                        .map_err(|e| Error::Invalid(e.to_string()))?
+                        .map_err(Error::invalid_source)?
                     )
                 ))?;
                 let token = cancellation.clone();
@@ -863,7 +939,9 @@ impl<J: Journal> PlanEngine<J> {
                             .clone()
                     })
                     .collect();
+                let plan_id = spec.id.clone();
                 tasks.spawn(async move {
+                    let context = crate::ErrorContext { transaction: Some(plan_id.as_str().into()), step: Some(step.id.as_str().into()), phase: Some("plan_step".into()), ..Default::default() };
                     let call = async {
                         // Guards survive a dropped execution future until its aborted
                         // tasks are actually destroyed, bounding overlapping resumes.
@@ -885,58 +963,109 @@ impl<J: Journal> PlanEngine<J> {
                         .await
                         {
                             Ok(Ok(result)) => match result.validate(&step.work) {
-                                Ok(()) => Report::Result(result),
-                                Err(e) => Report::Uncertain(e.to_string()),
+                                Ok(()) => (Report::Result(result), None),
+                                Err(e) => failure_report(e, context.clone()),
                             },
-                            Ok(Err(e)) => Report::Uncertain(e.to_string()),
-                            Err(_) => Report::Uncertain(
-                                "step timed out; effects require reconciliation".into(),
-                            ),
+                            Ok(Err(e)) => failure_report(e, context.clone()),
+                            Err(e) => failure_report(Error::operational(crate::Diagnostic::caused(crate::ErrorCode::Timeout, e)), context.clone()),
                         }
                     };
                     let report = tokio::select! {
                         biased;
-                        _ = token.cancelled() => Report::Uncertain(
-                            "cancelled in flight; effects require reconciliation".into(),
-                        ),
+                        _ = token.cancelled() => failure_report(Error::operational(crate::Diagnostic::message(crate::ErrorCode::Cancelled, "cancelled in flight".into())), context),
                         report = call => report,
                     };
-                    (step.id, attempt, report)
+                    (step.id, attempt, report.0, report.1)
                 });
             }
             if tasks.is_empty() {
                 break;
             }
             match tasks.join_next().await.expect("nonempty task set") {
-                Ok((step, attempt, report)) => {
+                Ok((step, attempt, report, diagnostic)) => {
                     self.persist(Record::Report {
                         plan: spec.id.clone(),
                         step: step.clone(),
                         attempt,
                         report,
                     })?;
+                    self.states
+                        .get_mut(&spec.id)
+                        .unwrap()
+                        .steps
+                        .get_mut(&step)
+                        .unwrap()
+                        .diagnostic = diagnostic;
                     active.remove(&step);
                 }
                 Err(e) => {
+                    let diagnostic = crate::Diagnostic::caused(crate::ErrorCode::AdapterUnknown, e);
+                    diagnostic.trace();
                     // A panic invalidates all in-flight acknowledgements; dropping
                     // their futures is safe by the adapter receipt contract.
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     for step in active.keys() {
                         let attempt = self.states[&spec.id].steps[step].attempts;
+                        let (report, local) = failure_report(
+                            Error::operational(diagnostic.clone()),
+                            crate::ErrorContext {
+                                transaction: Some(spec.id.as_str().into()),
+                                step: Some(step.as_str().into()),
+                                phase: Some("plan_step".into()),
+                                ..Default::default()
+                            },
+                        );
                         self.persist(Record::Report {
                             plan: spec.id.clone(),
                             step: step.clone(),
                             attempt,
-                            report: Report::Uncertain(format!("adapter task failed: {e}")),
+                            report,
                         })?;
+                        self.states
+                            .get_mut(&spec.id)
+                            .unwrap()
+                            .steps
+                            .get_mut(step)
+                            .unwrap()
+                            .diagnostic = local;
                     }
                     break;
                 }
             }
         }
         self.status(&spec.id)?
-            .ok_or_else(|| Error::Corrupt("plan disappeared".into()))
+            .ok_or_else(|| Error::corrupt("plan disappeared".into()))
+    }
+    /// Authorize one retry after repairing a classified operational failure.
+    /// Keeps the immutable specification, receipt key and prior uncertainty.
+    pub fn retry_step(
+        &mut self,
+        plan: &PlanId,
+        step: &StepId,
+        reason: impl Into<String>,
+    ) -> Result<(), Error> {
+        self.healthy()?;
+        let reason = reason.into();
+        let status = self
+            .states
+            .get(plan)
+            .and_then(|s| s.steps.get(step))
+            .ok_or_else(|| Error::invalid("unknown plan step".into()))?;
+        if reason.is_empty()
+            || reason.len() > 4096
+            || status.retry_authorized
+            || !matches!(&status.report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention))
+        {
+            return Err(Error::invalid(
+                "step is not manually blocked or retry reason is invalid".into(),
+            ));
+        }
+        self.persist(Record::Retry {
+            plan: plan.clone(),
+            step: step.clone(),
+            reason,
+        })
     }
     /// Reconcile an existing plan using its durable immutable spec.
     pub async fn resume(
@@ -948,7 +1077,7 @@ impl<J: Journal> PlanEngine<J> {
         let spec = self
             .states
             .get(id)
-            .ok_or_else(|| Error::Invalid("unknown plan".into()))?
+            .ok_or_else(|| Error::invalid("unknown plan".into()))?
             .spec
             .clone();
         self.execute(spec, cancellation).await
@@ -996,6 +1125,21 @@ impl<J: Journal> crate::recovery::RecoveryTarget for PlanEngine<J> {
     }
     fn replay_position(&self) -> u64 {
         self.sequence
+    }
+    fn resume_work(&mut self, key: &str) -> Result<(), Error> {
+        self.healthy()?;
+        let plan = PlanId::new(key)?;
+        let state = self
+            .states
+            .get(&plan)
+            .ok_or_else(|| Error::invalid("unknown plan".into()))?;
+        let blocked: Vec<_> = state.steps.iter().filter_map(|(step, status)| {
+            (!status.retry_authorized && matches!(&status.report, Some(Report::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention))).then_some(step.clone())
+        }).collect();
+        for step in blocked {
+            self.retry_step(&plan, &step, "recovery service operator resume")?;
+        }
+        Ok(())
     }
     async fn recover_one(
         &mut self,

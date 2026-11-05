@@ -159,3 +159,8 @@ inside every SQLite/VFS instruction or hardware power loss.
 
 Run the workspace build, format, strict Clippy, tests and rustdoc checks from the
 root README. No GitHub-hosted CI is needed.
+
+## Saga operational failures
+
+See the [structured error contract](error-handling.md) for stable codes,
+source/context propagation, safe retry guidance and migration details.

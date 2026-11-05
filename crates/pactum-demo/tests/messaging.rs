@@ -10,8 +10,8 @@ use std::{
     time::Duration,
 };
 
-fn err(e: impl std::fmt::Display) -> Error {
-    Error(e.to_string())
+fn err(e: impl Into<pactum_sqlite::AdapterError>) -> Error {
+    Error::from_diagnostic(e.into().diagnostic())
 }
 fn message(id: &str) -> Message {
     Message {
@@ -140,14 +140,7 @@ fn leases_are_exclusive_fenced_and_restart_safe_with_bounded_crash_attempts() {
     assert!(first.acknowledge(&old).is_err());
     assert!(
         first
-            .fail(
-                &old,
-                10,
-                &SendError {
-                    detail: "stale".into(),
-                    permanent: true
-                }
-            )
+            .fail(&old, 10, &SendError::rejected("stale".into()))
             .is_err()
     );
     drop(first);
@@ -270,13 +263,13 @@ async fn timeout_and_cancelled_pass_leave_recoverable_messages() {
         d.dispatch(&mut s, &mut Hanging, || 0).await.unwrap().failed,
         1
     );
-    assert!(
-        s.delivery("one")
-            .unwrap()
-            .unwrap()
-            .last_error
-            .unwrap()
-            .contains("unknown")
+    let timed_out = s.delivery("one").unwrap().unwrap();
+    assert_eq!(timed_out.state, DeliveryState::Pending);
+    let failure = timed_out.failure.unwrap();
+    assert_eq!(failure.code, pactum_errors::ErrorCode::Timeout);
+    assert_eq!(
+        failure.disposition,
+        pactum_errors::RetryDisposition::ReconcileBeforeRetry
     );
     let d = Dispatcher {
         send_timeout: Duration::from_secs(60),
@@ -512,7 +505,7 @@ fn validation_and_future_schema_fail_before_effects() {
     );
     assert_eq!(policy().delay(u32::MAX), 20);
     s.connection()
-        .execute("UPDATE pactum_message_meta SET version=2", [])
+        .execute("UPDATE pactum_message_meta SET version=3", [])
         .unwrap();
     drop(s);
     assert!(SqliteMessaging::open(&path).is_err());
@@ -649,4 +642,56 @@ fn process_crash_matrix_recovers_committed_events_without_double_effects() {
             1
         );
     }
+}
+
+#[test]
+fn typed_send_failure_survives_restart_and_v1_outbox_migration_preserves_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metadata.db");
+    let mut store = open(&path);
+    let message = message("metadata-message");
+    store.produce(&message, policy(), |_| Ok(())).unwrap();
+    let claim = store.claim(0, 10, 1).unwrap().remove(0);
+    let failure = SendError::from_source(std::io::Error::other("token=SECRET"));
+    store.fail(&claim, 0, &failure).unwrap();
+    let saved = store.delivery(&message.id).unwrap().unwrap();
+    let metadata = saved.failure.as_ref().unwrap();
+    assert_eq!(metadata.code, pactum_errors::ErrorCode::TransportUnknown);
+    assert_eq!(
+        metadata.context.transaction.as_deref(),
+        Some(message.id.as_str())
+    );
+    let raw: String = store
+        .connection()
+        .query_row(
+            "SELECT last_failure FROM pactum_outbox WHERE id=?1",
+            [&message.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!raw.contains("SECRET"));
+    drop(store);
+    let store = open(&path);
+    assert_eq!(store.delivery(&message.id).unwrap().unwrap(), saved);
+    // Recreate the original v1 schema around an existing retained envelope.
+    store.connection().execute_batch("ALTER TABLE pactum_outbox DROP COLUMN last_failure; UPDATE pactum_message_meta SET version=1;").unwrap();
+    drop(store);
+    let mut migrated = open(&path);
+    let old = migrated.delivery(&message.id).unwrap().unwrap();
+    assert_eq!(old.message, saved.message);
+    assert_eq!(old.state, saved.state);
+    assert_eq!(old.attempts, saved.attempts);
+    assert!(old.failure.is_none());
+    assert!(
+        !migrated
+            .produce(&message, policy(), |_| panic!(
+                "must retain the original producer receipt"
+            ))
+            .unwrap()
+    );
+    let version: u32 = migrated
+        .connection()
+        .query_row("SELECT version FROM pactum_message_meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
 }

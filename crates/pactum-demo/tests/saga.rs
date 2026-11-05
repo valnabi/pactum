@@ -182,10 +182,20 @@ async fn permanent_compensation_failure_and_irreversible_boundary_require_manual
             "compensation failed"
         }));
         assert!(e.retry(&p.id, "cannot bypass permanent boundary").is_err());
-        assert!(matches!(
-            e.recover_one("p", &Cancellation::default()).await,
-            Err(Error::Invalid(_))
-        ));
+        let failure = e
+            .recover_one("p", &Cancellation::default())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code(), pactum_core::ErrorCode::OperatorRequired);
+        assert_eq!(failure.context().transaction.as_deref(), Some("p"));
+        assert_eq!(
+            failure.retry_disposition(pactum_core::RetryContext {
+                authority_valid: true,
+                idempotent: true,
+                ..Default::default()
+            }),
+            pactum_core::RetryDisposition::OperatorIntervention
+        );
         assert_eq!(e.pending_work().unwrap().len(), 1);
         drop(e);
         let mut e = support::open(dir.path(), stub.clone());
@@ -241,7 +251,11 @@ impl SagaAdapter for Ambiguous {
     fn accepts(&self, p: &[u8]) -> bool {
         self.inner.accepts(p)
     }
-    async fn execute(&self, key: OperationId, payload: Vec<u8>) -> Result<ActionResult, String> {
+    async fn execute(
+        &self,
+        key: OperationId,
+        payload: Vec<u8>,
+    ) -> Result<ActionResult, pactum_core::saga::SagaError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let result = self.inner.execute(key, payload.clone()).await?;
         let mut faults = self.faults.lock().unwrap();
@@ -288,7 +302,16 @@ async fn ambiguous_forward_never_starts_compensation_and_reconciles_same_receipt
     assert_eq!(s.steps[&sid("notify")].forward.attempts, 0);
     drop(e);
     let mut e = custom_engine(dir.path(), adapter, SagaPolicy::default());
-    assert_eq!(e.resume(&p.id, &Cancellation::default()).await.unwrap(), s);
+    let mut durable = s;
+    assert!(durable.steps[&sid("ship")].forward.diagnostic.is_some());
+    for step in durable.steps.values_mut() {
+        step.forward.diagnostic = None;
+        step.compensation.diagnostic = None;
+    }
+    assert_eq!(
+        e.resume(&p.id, &Cancellation::default()).await.unwrap(),
+        durable
+    );
     RecoveryTarget::resume_work(&mut e, "p").unwrap();
     let s = e.resume(&p.id, &Cancellation::default()).await.unwrap();
     assert_eq!(s.outcome, SagaOutcome::Compensated);
@@ -339,7 +362,11 @@ impl SagaAdapter for Slow {
     fn accepts(&self, p: &[u8]) -> bool {
         self.inner.accepts(p)
     }
-    async fn execute(&self, key: OperationId, p: Vec<u8>) -> Result<ActionResult, String> {
+    async fn execute(
+        &self,
+        key: OperationId,
+        p: Vec<u8>,
+    ) -> Result<ActionResult, pactum_core::saga::SagaError> {
         let r = self.inner.execute(key, p).await?;
         match self.behavior.swap(0, Ordering::SeqCst) {
             1 => tokio::time::sleep(Duration::from_secs(60)).await,
@@ -457,7 +484,7 @@ async fn changed_payload_compensator_identity_namespace_and_invalid_policy_fail_
     changed.steps[0].compensation = Compensation::Operation(operation("add:-11"));
     assert!(matches!(
         e.execute(changed, &Cancellation::default()).await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     let key = e
         .operation_key(&p.id, &sid("reserve"), Direction::Forward)
@@ -476,7 +503,7 @@ async fn changed_payload_compensator_identity_namespace_and_invalid_policy_fail_
     let mut e = custom_engine(dir.path(), replacement.clone(), SagaPolicy::default());
     assert!(matches!(
         e.resume(&p.id, &Cancellation::default()).await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     assert!(replacement.effects().is_empty());
     drop(e);
@@ -546,7 +573,7 @@ impl Fault {
             if self.kill {
                 std::process::exit(86);
             }
-            return Err(JournalError("lost acknowledgement".into()));
+            return Err(JournalError::message("lost acknowledgement".into()));
         }
         Ok(())
     }
@@ -584,10 +611,18 @@ impl SagaAdapter for FaultAdapter {
     fn accepts(&self, p: &[u8]) -> bool {
         self.inner.accepts(p)
     }
-    async fn execute(&self, key: OperationId, p: Vec<u8>) -> Result<ActionResult, String> {
-        self.fault.tick().map_err(|e| e.0)?;
+    async fn execute(
+        &self,
+        key: OperationId,
+        p: Vec<u8>,
+    ) -> Result<ActionResult, pactum_core::saga::SagaError> {
+        self.fault
+            .tick()
+            .map_err(pactum_core::saga::SagaError::from_source)?;
         let result = self.inner.execute(key, p).await?;
-        self.fault.tick().map_err(|e| e.0)?;
+        self.fault
+            .tick()
+            .map_err(pactum_core::saga::SagaError::from_source)?;
         Ok(result)
     }
 }
@@ -632,10 +667,10 @@ async fn attempt(dir: &Path, target: usize, kill: bool, scenario: &str) -> usize
         }
         .await;
         if result.is_err() {
-            assert!(matches!(e.status(&p.id), Err(Error::InDoubt(_))));
+            assert!(matches!(e.status(&p.id), Err(Error::InDoubt { .. })));
             assert!(matches!(
                 e.resume(&p.id, &Cancellation::default()).await,
-                Err(Error::InDoubt(_))
+                Err(Error::InDoubt { .. })
             ));
         }
     }
@@ -920,7 +955,7 @@ async fn replay_rejects_illegal_transitions_versions_sequences_and_early_compens
     for (index, value) in cases {
         let mut bad = entries[..=index].to_vec();
         bad[index].payload = serde_json::to_vec(&value).unwrap();
-        assert!(matches!(replay(bad), Err(Error::Corrupt(_))), "{value}");
+        assert!(matches!(replay(bad), Err(Error::Corrupt { .. })), "{value}");
     }
     let mut bad = entries.clone();
     bad[0].version = 99;
@@ -931,4 +966,83 @@ async fn replay_rejects_illegal_transitions_versions_sequences_and_early_compens
     let mut bad = entries;
     bad[1].payload = b"{".to_vec();
     assert!(replay(bad).is_err());
+}
+
+struct ClassifiedSaga {
+    inner: Arc<ExternalStub>,
+    failing: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl SagaAdapter for ClassifiedSaga {
+    fn identity(&self) -> String {
+        self.inner.identity()
+    }
+    fn accepts(&self, payload: &[u8]) -> bool {
+        self.inner.accepts(payload)
+    }
+    async fn execute(&self, key: OperationId, payload: Vec<u8>) -> Result<ActionResult, SagaError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            Err(SagaError::classified(
+                pactum_core::ErrorCode::InvalidInput,
+                std::io::Error::other("credential=SECRET"),
+            ))
+        } else {
+            self.inner.execute(key, payload).await
+        }
+    }
+}
+#[tokio::test]
+async fn permanent_saga_call_error_is_unknown_effect_and_never_a_rejection_vote() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Arc::new(ExternalStub::open(&dir.path().join("external.db")));
+    let adapter = Arc::new(ClassifiedSaga {
+        inner: stub.clone(),
+        failing: std::sync::atomic::AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
+    let mut engine = custom_engine(dir.path(), adapter.clone(), SagaPolicy::default());
+    let spec = spec("typed-saga", false, false, false);
+    let status = engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(status.outcome, SagaOutcome::Uncertain);
+    assert!(status.needs_intervention && !status.compensating);
+    assert!(stub.effects().is_empty());
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    let action = &status.steps[&sid("reserve")].forward;
+    assert!(action.diagnostic.is_some());
+    let Some(ActionResult::Operational(metadata)) = &action.report else {
+        panic!("expected code-bearing uncertain effect")
+    };
+    assert_eq!(metadata.code, pactum_core::ErrorCode::InvalidInput);
+    assert!(!serde_json::to_string(action).unwrap().contains("SECRET"));
+    drop(engine);
+    adapter.failing.store(false, Ordering::SeqCst);
+    let mut engine = custom_engine(dir.path(), adapter.clone(), SagaPolicy::default());
+    let status = engine
+        .resume(&spec.id, &Cancellation::default())
+        .await
+        .unwrap();
+    assert!(status.needs_intervention && !status.compensating);
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    engine
+        .retry(
+            &spec.id,
+            "repaired adapter configuration; retained receipt store",
+        )
+        .unwrap();
+    drop(engine);
+    let mut engine = custom_engine(dir.path(), adapter, SagaPolicy::default());
+    assert_eq!(
+        engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap()
+            .outcome,
+        SagaOutcome::Completed
+    );
+    assert_eq!(stub.effects(), vec![10, 20]);
 }

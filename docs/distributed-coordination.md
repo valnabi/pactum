@@ -63,7 +63,10 @@ applications still manage lease renewal and replacement of expired sessions.
 
 ## Remote protocol
 
-`Transport::exchange` carries serializable `Request` and `Response` envelopes.
+`Transport::exchange` carries serializable protocol-v2 `Request` and `Response`
+envelopes. Responses carry typed `RemoteFailure { code, context }` on failure;
+server source text is never serialized. Version-1 peers must be upgraded together.
+See the [error contract and migration](error-handling.md).
 Requests include protocol version, exact grant, resource identity, transaction,
 operation, a stable SHA-256 request identity and an attempt deadline. Identity
 binds all immutable arguments; the deadline can change between attempts. A new

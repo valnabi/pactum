@@ -113,6 +113,17 @@ pub enum Operation {
     /// Inspect durable state.
     Status,
 }
+impl Operation {
+    /// Safe phase label, independent of payload/token contents.
+    pub fn phase(&self) -> &'static str {
+        match self {
+            Self::Prepare(_) => "prepare",
+            Self::Commit(_) => "commit",
+            Self::Abort(_) => "abort",
+            Self::Status => "status",
+        }
+    }
+}
 /// Version-independent typed resource response; invalid operation/response pairs fail.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +166,10 @@ struct BoundResource {
     grant: Grant,
 }
 fn invalid_reply() -> ParticipantError {
-    ParticipantError("invalid resource response".into())
+    ParticipantError::from_diagnostic(pactum_errors::Diagnostic::message(
+        pactum_errors::ErrorCode::ProtocolMismatch,
+        "invalid resource response".into(),
+    ))
 }
 #[async_trait]
 impl Participant for BoundResource {
@@ -229,7 +243,7 @@ impl DistributedCoordinator {
         policy: RetryPolicy,
     ) -> Result<Self, Error> {
         if store.domain() != grant.domain || resources.iter().any(|r| r.domain() != grant.domain) {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "journal/resource authority domain mismatch".into(),
             ));
         }

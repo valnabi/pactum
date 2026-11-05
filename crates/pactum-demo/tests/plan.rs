@@ -139,7 +139,7 @@ impl StepAdapter for Probe {
         self.peak.fetch_max(n, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(if value == 99 { 200 } else { 10 })).await;
         match value {
-            0 => Err(Error::InDoubt("offline".into())),
+            0 => Err(Error::in_doubt("offline".into())),
             8 => Ok(StepResult::Native(Progress::Atomic(AtomicStatus::Aborted))),
             9 => panic!("injected adapter panic"),
             7 => Ok(StepResult::Native(Progress::StagedPublish(
@@ -384,7 +384,7 @@ impl Fault {
             if self.kill {
                 std::process::exit(86);
             }
-            return Err(JournalError("lost acknowledgement".into()));
+            return Err(JournalError::message("lost acknowledgement".into()));
         }
         Ok(())
     }
@@ -428,9 +428,9 @@ impl StepAdapter for FaultAdapter {
         work: StepWork,
         c: &Cancellation,
     ) -> Result<StepResult, Error> {
-        self.fault.tick().map_err(|e| Error::InDoubt(e.0))?;
+        self.fault.tick().map_err(Error::in_doubt_source)?;
         let result = self.inner.execute(key, work, c).await?;
-        self.fault.tick().map_err(|e| Error::InDoubt(e.0))?;
+        self.fault.tick().map_err(Error::in_doubt_source)?;
         Ok(result)
     }
 }
@@ -464,7 +464,7 @@ async fn attempt(directory: &Path, target: usize, kill: bool) -> usize {
                 Err(_) => {
                     assert!(matches!(
                         e.status(&support::spec().id),
-                        Err(Error::InDoubt(_))
+                        Err(Error::InDoubt { .. })
                     ));
                     break;
                 }
@@ -616,7 +616,7 @@ async fn replay_fails_closed_on_illegal_histories_and_never_dispatches() {
     for (index, value) in cases {
         let mut bad = entries[..=index].to_vec();
         bad[index].payload = serde_json::to_vec(&value).unwrap();
-        assert!(matches!(replay(bad), Err(Error::Corrupt(_))), "{value}");
+        assert!(matches!(replay(bad), Err(Error::Corrupt { .. })), "{value}");
     }
     let mut bad = entries.clone();
     bad[0].version = 1;
@@ -758,7 +758,7 @@ async fn replacement_backend_cannot_rebind_an_existing_plan() {
     .unwrap();
     assert!(matches!(
         e.resume(&support::spec().id, &c).await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     drop(e);
     let b =
@@ -794,4 +794,101 @@ fn encoded_size_and_step_count_are_bounded_and_2pc_order_is_canonical() {
     };
     r.reverse();
     assert_eq!(p.fingerprint().unwrap(), hash);
+}
+
+struct ClassifiedAdapter {
+    failing: std::sync::atomic::AtomicBool,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl StepAdapter for ClassifiedAdapter {
+    fn identity(&self) -> String {
+        "classified-adapter-v1".into()
+    }
+    fn accepts(&self, _: &StepWork) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _: OperationId,
+        _: StepWork,
+        _: &Cancellation,
+    ) -> Result<StepResult, Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            Err(Error::operational(pactum_core::Diagnostic::caused(
+                pactum_core::ErrorCode::InvalidInput,
+                std::io::Error::other("password=SECRET"),
+            )))
+        } else {
+            Ok(StepResult::Native(Progress::Atomic(
+                AtomicStatus::Committed,
+            )))
+        }
+    }
+}
+#[tokio::test]
+async fn classified_plan_failure_requires_durable_operator_authorization() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = Arc::new(ClassifiedAdapter {
+        failing: std::sync::atomic::AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
+    let make = || {
+        PlanEngine::open(
+            SqliteJournal::open(dir.path().join("typed-plan.db")).unwrap(),
+            ns(),
+            BTreeMap::from([(
+                AdapterId::new("probe").unwrap(),
+                adapter.clone() as Arc<dyn StepAdapter>,
+            )]),
+            PlanPolicy::default(),
+        )
+        .unwrap()
+    };
+    let mut engine = make();
+    let spec = plan(vec![step("a", &[], 1, &[])]);
+    let status = engine
+        .execute(spec.clone(), &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(status.outcome, PlanOutcome::Indeterminate);
+    let failed = &status.steps[&sid("a")];
+    assert!(failed.diagnostic.is_some());
+    let Some(Report::Operational(metadata)) = &failed.report else {
+        panic!("expected typed operational failure")
+    };
+    assert_eq!(metadata.code, pactum_core::ErrorCode::InvalidInput);
+    assert_eq!(
+        metadata.disposition,
+        pactum_core::RetryDisposition::Permanent
+    );
+    assert!(
+        !serde_json::to_string(&failed.report)
+            .unwrap()
+            .contains("SECRET")
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    drop(engine);
+    adapter.failing.store(false, Ordering::SeqCst);
+    let mut engine = make();
+    let status = engine
+        .resume(&spec.id, &Cancellation::default())
+        .await
+        .unwrap();
+    assert!(status.steps[&sid("a")].diagnostic.is_none());
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    pactum_core::recovery::RecoveryTarget::resume_work(&mut engine, spec.id.as_str()).unwrap();
+    drop(engine);
+    let mut engine = make();
+    assert!(engine.status(&spec.id).unwrap().unwrap().steps[&sid("a")].retry_authorized);
+    assert_eq!(
+        engine
+            .resume(&spec.id, &Cancellation::default())
+            .await
+            .unwrap()
+            .outcome,
+        PlanOutcome::Complete
+    );
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
 }

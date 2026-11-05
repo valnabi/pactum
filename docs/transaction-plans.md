@@ -169,3 +169,8 @@ Existing mode tests cover their internal protocol crash boundaries.
 
 Run the workspace's documented local build, format, Clippy, tests and docs checks;
 no GitHub-hosted CI service is required.
+
+## Plan operational failures
+
+See the [structured error contract](error-handling.md) for stable codes,
+source/context propagation, safe retry guidance and migration details.

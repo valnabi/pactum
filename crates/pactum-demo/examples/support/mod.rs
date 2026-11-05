@@ -37,9 +37,9 @@ pub async fn demo(mode: &str) -> Result<(), Box<dyn std::error::Error>> {
         let open = || {
             Engine::open(
                 SqliteJournal::open(directory.join("modes-journal.db"))
-                    .map_err(|e| pactum_core::Error::InDoubt(e.to_string()))?,
+                    .map_err(pactum_core::Error::in_doubt_source)?,
                 SqliteBackend::open(directory.join("modes-backend.db"), "demo")
-                    .map_err(|e| pactum_core::Error::Invalid(e.to_string()))?,
+                    .map_err(pactum_core::Error::invalid_source)?,
                 ExecutionPolicy {
                     max_chunks: 1,
                     ..ExecutionPolicy::default()

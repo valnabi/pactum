@@ -1,11 +1,12 @@
 //! Versioned remote participant protocol. Transport errors always mean uncertainty.
 use crate::{Domain, FencedResource, Grant, Operation, Reply};
 use async_trait::async_trait;
-use pactum_core::{ParticipantError, ParticipantId, TransactionId};
+use pactum_core::{
+    Diagnostic, ErrorCode, ErrorContext, ParticipantError, ParticipantId, TransactionId,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,12 +15,12 @@ use std::{
 };
 
 /// Supported protocol version. Unknown versions fail before dispatch.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 fn now() -> Result<u64, TransportError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| TransportError(e.to_string()))?;
-    u64::try_from(elapsed.as_millis()).map_err(|e| TransportError(e.to_string()))
+        .map_err(TransportError::from_source)?;
+    u64::try_from(elapsed.as_millis()).map_err(TransportError::from_source)
 }
 /// Versioned request; transaction and immutable operation binding survive retries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +63,22 @@ impl Request {
         request.identity = request.expected_identity()?;
         Ok(request)
     }
+    /// Correlation fields only; excludes payload, prepared token and owner secrets.
+    pub fn context(&self) -> ErrorContext {
+        ErrorContext {
+            transaction: Some(self.transaction.as_str().into()),
+            participant: Some(self.resource.as_str().into()),
+            phase: Some(self.operation.phase().into()),
+            epoch: Some(self.grant.epoch),
+            request: Some(
+                self.identity
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            ),
+            ..ErrorContext::default()
+        }
+    }
     fn expected_identity(&self) -> Result<Vec<u8>, TransportError> {
         let binding = serde_json::to_vec(&(
             self.version,
@@ -70,7 +87,7 @@ impl Request {
             &self.transaction,
             &self.operation,
         ))
-        .map_err(|e| TransportError(e.to_string()))?;
+        .map_err(TransportError::from_source)?;
         Ok(Sha256::digest(binding).to_vec())
     }
 }
@@ -87,17 +104,65 @@ pub struct Response {
     /// Echoed durable transaction identity.
     pub transaction: TransactionId,
     /// Durable reply, or resource/ownership uncertainty. Never synthesize a no vote.
-    pub result: Result<Reply, String>,
+    pub result: Result<Reply, RemoteFailure>,
+}
+/// Version 2 wire failure. Source messages and payloads never cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, snafu::Snafu)]
+#[serde(deny_unknown_fields)]
+#[snafu(display("remote operation failed: {code}"))]
+pub struct RemoteFailure {
+    /// Stable server-side code, independent of its Display implementation.
+    pub code: ErrorCode,
+    /// Allowlisted correlation identifiers.
+    pub context: ErrorContext,
 }
 /// Exchange failure. Effects may already be durable, including after timeout.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransportError(pub String);
-impl fmt::Display for TransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct TransportError {
+    source: pactum_errors::Diagnostic,
+}
+impl TransportError {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::TransportUnknown,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::TransportUnknown, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
     }
 }
-impl std::error::Error for TransportError {}
+impl std::ops::Deref for TransportError {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
 /// Adapter for an authenticated, bounded remote exchange. No automatic retry here:
 /// the core RetryPolicy supplies bounded identical-operation retries.
 #[async_trait]
@@ -129,20 +194,29 @@ impl Endpoint {
             || request.grant.domain != self.resource.domain()
             || size > 1024 * 1024
         {
-            return Err(TransportError(
-                "invalid protocol, identity, resource, domain or message size".into(),
+            return Err(TransportError::from_diagnostic(
+                Diagnostic::message(
+                    ErrorCode::ProtocolMismatch,
+                    "invalid protocol envelope".into(),
+                )
+                .with_context(request.context()),
             ));
         }
         if now()? >= request.deadline_millis {
-            return Err(TransportError(
-                "request deadline expired; completion uncertain".into(),
+            return Err(TransportError::from_diagnostic(
+                Diagnostic::message(ErrorCode::Timeout, "request deadline expired".into())
+                    .with_context(request.context()),
             ));
         }
+        let context = request.context();
         let result = self
             .resource
             .call(&request.grant, &request.transaction, request.operation)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| RemoteFailure {
+                code: e.code(),
+                context,
+            });
         Ok(Response {
             version: VERSION,
             identity: request.identity,
@@ -168,7 +242,7 @@ impl RemoteResource {
         timeout: Duration,
     ) -> Result<Self, TransportError> {
         if timeout.as_millis() == 0 {
-            return Err(TransportError(
+            return Err(TransportError::message(
                 "timeout must be at least one millisecond".into(),
             ));
         }
@@ -194,37 +268,66 @@ impl FencedResource for RemoteResource {
         tx: &TransactionId,
         operation: Operation,
     ) -> Result<Reply, ParticipantError> {
-        let run = async {
-            let millis = u64::try_from(self.timeout.as_millis())
-                .map_err(|e| TransportError(e.to_string()))?;
+        let context = ErrorContext {
+            transaction: Some(tx.as_str().into()),
+            participant: Some(self.id.as_str().into()),
+            phase: Some(operation.phase().into()),
+            epoch: Some(grant.epoch),
+            ..ErrorContext::default()
+        };
+        let request = (|| {
+            let millis =
+                u64::try_from(self.timeout.as_millis()).map_err(TransportError::from_source)?;
             let deadline = now()?
                 .checked_add(millis)
-                .ok_or_else(|| TransportError("deadline overflow".into()))?;
-            let request = Request::new(
+                .ok_or_else(|| TransportError::message("deadline overflow".into()))?;
+            Request::new(
                 grant.clone(),
                 self.id.clone(),
                 tx.clone(),
                 operation,
                 deadline,
-            )?;
+            )
+        })()
+        .map_err(|e: TransportError| {
+            ParticipantError::classified(e.code(), e).with_context(context)
+        })?;
+        let context = request.context();
+        let run = async {
             let expected = request.identity.clone();
-            let response = self.transport.exchange(request).await?;
+            let request_context = request.context();
+            let response = self.transport.exchange(request).await.map_err(|e| {
+                let e = e.with_context(request_context.clone());
+                e.trace();
+                e
+            })?;
             if response.version != VERSION
                 || response.identity != expected
                 || response.resource != self.id
                 || &response.transaction != tx
             {
-                return Err(TransportError("uncorrelated remote response".into()));
+                return Err(TransportError::from_diagnostic(
+                    Diagnostic::message(
+                        ErrorCode::ProtocolMismatch,
+                        "uncorrelated remote response".into(),
+                    )
+                    .with_context(request_context),
+                ));
             }
-            response.result.map_err(TransportError)
+            response
+                .result
+                .map_err(|e| TransportError::classified(e.code, e).with_context(request_context))
         };
         match tokio::time::timeout(self.timeout, run).await {
-            Ok(result) => {
-                result.map_err(|e| ParticipantError(format!("remote completion uncertain: {e}")))
+            Ok(result) => result.map_err(|e| {
+                let prior = e.context().clone();
+                ParticipantError::classified(e.code(), e)
+                    .with_context(prior)
+                    .with_context(context.clone())
+            }),
+            Err(e) => {
+                Err(ParticipantError::classified(ErrorCode::Timeout, e).with_context(context))
             }
-            Err(_) => Err(ParticipantError(
-                "remote deadline exceeded; completion uncertain".into(),
-            )),
         }
     }
 }
@@ -257,22 +360,25 @@ impl Loopback {
 impl Transport for Loopback {
     async fn exchange(&self, request: Request) -> Result<Response, TransportError> {
         if self.partitioned.load(Ordering::SeqCst) {
-            return Err(TransportError("partition; completion uncertain".into()));
+            return Err(TransportError::from_diagnostic(
+                Diagnostic::message(ErrorCode::Unavailable, "transport unavailable".into())
+                    .with_context(request.context()),
+            ));
         }
         // Exercise the actual versioned serialization boundary.
-        let bytes = serde_json::to_vec(&request).map_err(|e| TransportError(e.to_string()))?;
-        let request = serde_json::from_slice(&bytes).map_err(|e| TransportError(e.to_string()))?;
+        let bytes = serde_json::to_vec(&request).map_err(TransportError::from_source)?;
+        let request = serde_json::from_slice(&bytes).map_err(TransportError::from_source)?;
         let response = self.endpoint.handle(request).await?;
         if self
             .lost_replies
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok()
         {
-            return Err(TransportError(
+            return Err(TransportError::message(
                 "reply lost after dispatch; completion uncertain".into(),
             ));
         }
-        let bytes = serde_json::to_vec(&response).map_err(|e| TransportError(e.to_string()))?;
-        serde_json::from_slice(&bytes).map_err(|e| TransportError(e.to_string()))
+        let bytes = serde_json::to_vec(&response).map_err(TransportError::from_source)?;
+        serde_json::from_slice(&bytes).map_err(TransportError::from_source)
     }
 }

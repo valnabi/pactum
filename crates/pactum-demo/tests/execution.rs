@@ -65,7 +65,7 @@ async fn atomic_rollback_idempotency_and_immutable_binding() {
     assert_eq!(e.backend().value("counter").unwrap(), 7);
     assert!(matches!(
         e.execute(id("a"), request("chunked"), &c).await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     // First delta succeeds in the savepoint; overflow on the second rolls it all back.
     let work = vec![
@@ -296,7 +296,9 @@ impl Fault {
             if self.kill {
                 std::process::exit(86);
             }
-            return Err(BackendError("injected lost acknowledgement".into()));
+            return Err(BackendError::message(
+                "injected lost acknowledgement".into(),
+            ));
         }
         Ok(())
     }
@@ -307,15 +309,15 @@ struct FaultJournal {
 }
 impl Journal for FaultJournal {
     fn append(&mut self, version: u32, payload: &[u8]) -> Result<Sequence, JournalError> {
-        self.fault.tick().map_err(|e| JournalError(e.0))?;
+        self.fault.tick().map_err(JournalError::from_source)?;
         let s = self.inner.append(version, payload)?;
-        self.fault.tick().map_err(|e| JournalError(e.0))?;
+        self.fault.tick().map_err(JournalError::from_source)?;
         Ok(s)
     }
     fn flush(&mut self) -> Result<Sequence, JournalError> {
-        self.fault.tick().map_err(|e| JournalError(e.0))?;
+        self.fault.tick().map_err(JournalError::from_source)?;
         let s = self.inner.flush()?;
-        self.fault.tick().map_err(|e| JournalError(e.0))?;
+        self.fault.tick().map_err(JournalError::from_source)?;
         Ok(s)
     }
     fn replay(&mut self) -> Result<Vec<Entry>, JournalError> {
@@ -388,7 +390,7 @@ async fn attempt(path: &Path, scenario: &str, target: usize, kill: bool) -> usiz
             c.cancel();
         }
         let result = e.execute(id("work"), request(scenario), &c).await;
-        if matches!(result, Err(Error::InDoubt(_))) {
+        if matches!(result, Err(Error::InDoubt { .. })) {
             assert!(e.status(&id("work")).is_err());
             assert!(e.recover(&Cancellation::default()).await.is_err());
         }
@@ -466,7 +468,7 @@ async fn verify(path: &Path, scenario: &str) {
             &c
         )
         .await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
 }
 #[tokio::test]

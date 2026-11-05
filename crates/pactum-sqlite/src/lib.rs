@@ -3,6 +3,9 @@
 //! Use local storage honoring SQLite locks and sync. Do not unlink lock files,
 //! use hard-link aliases, or access an open database through other writers.
 use fs2::FileExt;
+/// Typed SQLite adapter source errors.
+pub mod errors;
+pub use errors::AdapterError;
 /// Optional native-transaction outbox/inbox reference adapter.
 pub mod messaging;
 use pactum_journal::{Checkpoint, Entry, Journal, JournalError, Retention, Sequence};
@@ -12,8 +15,15 @@ use std::{
     fs::{File, OpenOptions},
     path::Path,
 };
-fn error(e: impl std::fmt::Display) -> JournalError {
-    JournalError(e.to_string())
+fn error(e: impl Into<AdapterError>) -> JournalError {
+    JournalError::from_diagnostic(e.into().diagnostic())
+}
+
+fn corrupt(detail: &str) -> JournalError {
+    JournalError::from_diagnostic(pactum_errors::Diagnostic::message(
+        pactum_errors::ErrorCode::CorruptHistory,
+        detail.into(),
+    ))
 }
 
 /// Exclusive SQLite journal. Drop rolls back unflushed records.
@@ -96,7 +106,7 @@ impl SqliteJournal {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(error)?;
         if schema > 2 {
-            return Err(error("unsupported SQLite journal schema"));
+            return Err(corrupt("unsupported SQLite journal schema"));
         }
         connection
             .execute_batch(
@@ -138,7 +148,12 @@ impl SqliteJournal {
             .query_row("PRAGMA quick_check", [], |r| r.get(0))
             .map_err(error)?;
         if integrity != "ok" {
-            return Err(error(integrity));
+            return Err(JournalError::from_diagnostic(
+                pactum_errors::Diagnostic::message(
+                    pactum_errors::ErrorCode::CorruptHistory,
+                    "SQLite integrity check failed".into(),
+                ),
+            ));
         }
         let mut journal = Self {
             connection,
@@ -165,7 +180,7 @@ impl SqliteJournal {
             || generation != journal.checkpoint()?.map_or(0, |c| c.generation)
             || hash != head_checksum(head, generation)
         {
-            return Err(error("journal head/checkpoint continuity mismatch"));
+            return Err(corrupt("journal head/checkpoint continuity mismatch"));
         }
         journal.generation = generation;
         journal.durable = last;
@@ -194,7 +209,7 @@ impl SqliteJournal {
             };
             let hash: Vec<u8> = row.get(3).map_err(error)?;
             if hash != checksum(entry.sequence, entry.version, &entry.payload) {
-                return Err(error("archive checksum mismatch"));
+                return Err(corrupt("archive checksum mismatch"));
             }
             visitor(entry)?;
         }
@@ -272,7 +287,9 @@ impl SqliteJournal {
     }
     fn healthy(&self) -> Result<(), JournalError> {
         if self.poisoned {
-            Err(error("journal write failed; drop and reopen"))
+            Err(JournalError::message(
+                "journal write failed; drop and reopen".into(),
+            ))
         } else {
             Ok(())
         }
@@ -364,7 +381,7 @@ impl Journal for SqliteJournal {
                 .checked_add(1)
                 .ok_or_else(|| error("sequence exhausted"))?;
             if sequence != expected || hash != checksum(sequence, version, &payload) {
-                return Err(error("journal sequence gap or checksum mismatch"));
+                return Err(corrupt("journal sequence gap or checksum mismatch"));
             }
             visitor(Entry {
                 sequence,
@@ -374,7 +391,7 @@ impl Journal for SqliteJournal {
         }
         // On open durable is not known yet; later reads must cover the known tail.
         if self.durable != 0 && expected != self.durable {
-            return Err(error("journal durable tail missing"));
+            return Err(corrupt("journal durable tail missing"));
         }
         Ok(())
     }
@@ -400,7 +417,7 @@ impl Journal for SqliteJournal {
             || checkpoint.watermark > i64::MAX as u64
             || hash != checkpoint_checksum(&checkpoint)
         {
-            return Err(error("corrupt or incompatible checkpoint"));
+            return Err(corrupt("corrupt or incompatible checkpoint"));
         }
         Ok(Some(checkpoint))
     }

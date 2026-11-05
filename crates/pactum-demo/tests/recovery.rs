@@ -62,10 +62,10 @@ impl Backend for Offline {
         _: &Request,
         _: Option<usize>,
     ) -> Result<UnitResult, BackendError> {
-        Err(BackendError("offline".into()))
+        Err(BackendError::message("offline".into()))
     }
     fn stage(&mut self, _: &OperationId, _: &PublishRequest) -> Result<(), BackendError> {
-        Err(BackendError("offline".into()))
+        Err(BackendError::message("offline".into()))
     }
     fn validate(&mut self, _: &OperationId, _: &PublishRequest) -> Result<bool, BackendError> {
         unreachable!()
@@ -315,7 +315,7 @@ impl Participant for NoCommit {
         self.0.prepare(tx, payload).await
     }
     async fn commit(&self, _: &TransactionId, _: &[u8]) -> Result<(), ParticipantError> {
-        Err(ParticipantError("unavailable".into()))
+        Err(ParticipantError::message("unavailable".into()))
     }
     async fn abort(
         &self,
@@ -391,7 +391,7 @@ async fn participant_return_and_manual_controls_never_reverse_commit() {
     assert_eq!(participant.value().await.unwrap(), 9);
     assert!(matches!(
         handle.control("committed", Control::Retry).await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     handle.stop();
     drop(join.await.unwrap().unwrap());
@@ -405,7 +405,9 @@ impl Journal for Ambiguous {
     }
     fn flush(&mut self) -> Result<u64, JournalError> {
         self.0.flush()?;
-        Err(JournalError("lost protocol barrier acknowledgement".into()))
+        Err(JournalError::message(
+            "lost protocol barrier acknowledgement".into(),
+        ))
     }
     fn replay(&mut self) -> Result<Vec<Entry>, JournalError> {
         self.0.replay()
@@ -431,7 +433,7 @@ async fn uncertain_protocol_write_stops_runner_and_reopen_reconciles_receipts() 
         )
         .unwrap();
         let (handle, join) = runner.start();
-        assert!(matches!(join.await.unwrap(), Err(Error::InDoubt(_))));
+        assert!(matches!(join.await.unwrap(), Err(Error::InDoubt { .. })));
         assert!(handle.target().lock().await.status(&id("work")).is_err());
         drop(handle);
         let traces = Arc::new(std::sync::Mutex::new(Vec::new()));

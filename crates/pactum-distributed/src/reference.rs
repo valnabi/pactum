@@ -16,14 +16,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-fn failure(e: impl std::fmt::Display) -> Error {
-    Error::InDoubt(e.to_string())
+fn failure(e: impl Into<pactum_sqlite::AdapterError>) -> Error {
+    Error::operational(e.into().diagnostic())
 }
 fn invalid(s: &str) -> Error {
-    Error::Invalid(s.into())
+    Error::invalid(s.into())
 }
-fn journal_error(e: impl std::fmt::Display) -> JournalError {
-    JournalError(e.to_string())
+fn journal_error(e: impl Into<pactum_sqlite::AdapterError>) -> JournalError {
+    JournalError::from_diagnostic(e.into().diagnostic())
 }
 fn hash(sequence: u64, version: u32, payload: &[u8]) -> Vec<u8> {
     let mut digest = Sha256::new();
@@ -132,7 +132,10 @@ impl ReferenceStore {
         &self,
         operation: impl FnOnce(&Transaction<'_>, u64) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut connection = self.connection.lock().map_err(failure)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| failure("authority mutex poisoned"))?;
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failure)?;
@@ -144,7 +147,15 @@ impl ReferenceStore {
     }
     fn validate(&self, tx: &Transaction<'_>, now: u64, grant: &Grant) -> Result<(), Error> {
         if grant.domain != self.domain {
-            return Err(invalid("authority domain mismatch"));
+            return Err(Error::operational(pactum_errors::Diagnostic::message(
+                pactum_errors::ErrorCode::StaleOwner,
+                "authority domain mismatch".into(),
+            ))
+            .with_context(pactum_errors::ErrorContext {
+                epoch: Some(grant.epoch),
+                operation: Some("validate_grant".into()),
+                ..Default::default()
+            }));
         }
         let (epoch, owner, expires): (u64, Option<String>, u64) = tx
             .query_row(
@@ -154,7 +165,15 @@ impl ReferenceStore {
             )
             .map_err(failure)?;
         if epoch != grant.epoch || owner.as_deref() != Some(&grant.owner) || now >= expires {
-            return Err(invalid("stale, released or expired grant"));
+            return Err(Error::operational(pactum_errors::Diagnostic::message(
+                pactum_errors::ErrorCode::StaleOwner,
+                "stale, released or expired grant".into(),
+            ))
+            .with_context(pactum_errors::ErrorContext {
+                epoch: Some(grant.epoch),
+                operation: Some("validate_grant".into()),
+                ..Default::default()
+            }));
         }
         Ok(())
     }
@@ -208,7 +227,10 @@ impl LeaseAuthority for ReferenceStore {
                 )
                 .map_err(failure)?;
             if current.is_some() && now < until {
-                return Err(invalid("scope already owned"));
+                return Err(Error::operational(pactum_errors::Diagnostic::message(
+                    pactum_errors::ErrorCode::OwnershipBusy,
+                    "scope already owned".into(),
+                )));
             }
             let epoch = epoch
                 .checked_add(1)
@@ -264,7 +286,7 @@ fn checkpoint(tx: &Transaction<'_>) -> Result<Option<Checkpoint>, Error> {
         let mut bytes = c.generation.to_be_bytes().to_vec();
         bytes.extend(&c.payload);
         if c.generation == 0 || digest != hash(c.watermark, c.version, &bytes) {
-            return Err(Error::Corrupt("checkpoint checksum mismatch".into()));
+            return Err(Error::corrupt("checkpoint checksum mismatch".into()));
         }
         Ok(c)
     })
@@ -287,13 +309,13 @@ fn entries(tx: &Transaction<'_>) -> Result<Vec<Entry>, Error> {
         if Some(entry.sequence) != expected.checked_add(1)
             || digest != hash(entry.sequence, entry.version, &entry.payload)
         {
-            return Err(Error::Corrupt("journal gap or checksum mismatch".into()));
+            return Err(Error::corrupt("journal gap or checksum mismatch".into()));
         }
         expected = entry.sequence;
         result.push(entry);
     }
     if expected != head(tx)? {
-        return Err(Error::Corrupt("journal head mismatch".into()));
+        return Err(Error::corrupt("journal head mismatch".into()));
     }
     Ok(result)
 }
@@ -325,7 +347,9 @@ struct ReferenceJournal {
 impl ReferenceJournal {
     fn healthy(&self) -> Result<(), JournalError> {
         if self.poisoned {
-            Err(journal_error("drop and reopen journal after write failure"))
+            Err(JournalError::message(
+                "drop and reopen journal after write failure".into(),
+            ))
         } else {
             Ok(())
         }
@@ -338,7 +362,10 @@ impl Journal for ReferenceJournal {
         self.store
             .fenced(&self.grant, |tx| {
                 if head(tx)? != self.base {
-                    return Err(invalid("journal session superseded"));
+                    return Err(Error::operational(pactum_errors::Diagnostic::message(
+                        pactum_errors::ErrorCode::StaleOwner,
+                        "journal session superseded".into(),
+                    )));
                 }
                 Ok(())
             })
@@ -364,7 +391,10 @@ impl Journal for ReferenceJournal {
             .store
             .fenced(&self.grant, |tx| {
                 if head(tx)? != self.base {
-                    return Err(invalid("journal session superseded"));
+                    return Err(Error::operational(pactum_errors::Diagnostic::message(
+                        pactum_errors::ErrorCode::StaleOwner,
+                        "journal session superseded".into(),
+                    )));
                 }
                 for e in &self.staged {
                     tx.execute(
@@ -464,9 +494,16 @@ impl FencedResource for ReferenceCounter {
         id: &TransactionId,
         operation: Operation,
     ) -> Result<Reply, ParticipantError> {
+        let context = pactum_errors::ErrorContext {
+            transaction: Some(id.as_str().into()),
+            participant: Some(self.id.as_str().into()),
+            phase: Some(operation.phase().into()),
+            epoch: Some(grant.epoch),
+            ..Default::default()
+        };
         self.store
             .fenced(grant, |tx| self.apply(tx, id, operation))
-            .map_err(|e| ParticipantError(e.to_string()))
+            .map_err(|e| ParticipantError::classified(e.code(), e).with_context(context))
     }
 }
 
@@ -489,7 +526,7 @@ impl ReferenceCounter {
             .map_err(failure)?;
         let state = work.as_ref().map(|w| w.2);
         if state.is_some_and(|s| s > 2) {
-            return Err(Error::Corrupt("invalid resource state".into()));
+            return Err(Error::corrupt("invalid resource state".into()));
         }
         match operation {
             Operation::Status => Ok(match work {
@@ -497,7 +534,7 @@ impl ReferenceCounter {
                 Some((_, Some(token), 0)) => Reply::Prepared(token),
                 Some((_, _, 1)) => Reply::Committed,
                 Some((_, _, 2)) => Reply::Aborted,
-                _ => return Err(Error::Corrupt("missing prepare token".into())),
+                _ => return Err(Error::corrupt("missing prepare token".into())),
             }),
             Operation::Prepare(payload) => {
                 if let Some((bound, token, state)) = work {
@@ -508,7 +545,7 @@ impl ReferenceCounter {
                         return Err(invalid("transaction payload changed"));
                     }
                     return Ok(Reply::Prepared(
-                        token.ok_or_else(|| Error::Corrupt("missing token".into()))?,
+                        token.ok_or_else(|| Error::corrupt("missing token".into()))?,
                     ));
                 }
                 let delta = std::str::from_utf8(&payload)
@@ -538,7 +575,7 @@ impl ReferenceCounter {
                         .map_err(failure)?;
                     reserved = reserved
                         .checked_add(pending)
-                        .ok_or_else(|| Error::Corrupt("invalid capacity reservation".into()))?;
+                        .ok_or_else(|| Error::corrupt("invalid capacity reservation".into()))?;
                 }
                 if reserved.checked_add(delta).is_none() {
                     return Ok(Reply::Rejected("counter capacity exhausted".into()));

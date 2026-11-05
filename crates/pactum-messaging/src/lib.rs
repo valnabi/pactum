@@ -2,18 +2,55 @@
 //! See `docs/messaging.md` for atomicity, retention and adapter obligations.
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fmt, time::Duration};
+use std::{collections::VecDeque, time::Duration};
 
 /// Messaging validation, storage or fencing error. A storage error at commit may
 /// be ambiguous: reopen and retry with the same immutable message identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(pub String);
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct Error {
+    source: pactum_errors::Diagnostic,
+}
+impl Error {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::InvalidInput,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::Storage, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
     }
 }
-impl std::error::Error for Error {}
+impl std::ops::Deref for Error {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
 
 /// Immutable, versioned envelope. IDs are unique within an outbox and within a
 /// consumer's inbox. Route, order and bytes are part of the permanent binding.
@@ -36,7 +73,7 @@ pub struct Message {
 /// Validate a durable name (1..=256 bytes, no control characters).
 pub fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
-        return Err(Error("invalid messaging name".into()));
+        return Err(Error::message("invalid messaging name".into()));
     }
     Ok(())
 }
@@ -46,12 +83,14 @@ impl Message {
         validate_name(&self.id)?;
         validate_name(&self.route)?;
         if self.version == 0 || self.payload.len() > 16 * 1024 * 1024 {
-            return Err(Error("invalid version or payload exceeds 16 MiB".into()));
+            return Err(Error::message(
+                "invalid version or payload exceeds 16 MiB".into(),
+            ));
         }
         match (&self.ordering_key, self.sequence) {
             (None, None) => Ok(()),
             (Some(key), Some(1..=0x7fff_ffff_ffff_ffff)) => validate_name(key),
-            _ => Err(Error(
+            _ => Err(Error::message(
                 "ordering requires a key and positive signed-64 sequence".into(),
             )),
         }
@@ -82,8 +121,10 @@ pub struct Delivery {
     pub attempts: u32,
     /// Next retry time or current lease deadline, Unix milliseconds.
     pub available_at: i64,
-    /// Most recent failure or expiry diagnostic.
+    /// Most recent human-facing failure or expiry diagnostic.
     pub last_error: Option<String>,
+    /// Stable metadata for the last failed send/expired budget; no source text.
+    pub failure: Option<pactum_errors::FailureMetadata>,
 }
 /// Durable fenced claim. Only the current attempt may acknowledge or fail it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,7 +159,7 @@ impl RetryPolicy {
     /// Reject unusable policies before work is recorded.
     pub fn validate(self) -> Result<(), Error> {
         if self.max_attempts == 0 || self.backoff_ms < 0 || self.max_backoff_ms < self.backoff_ms {
-            return Err(Error("invalid messaging retry policy".into()));
+            return Err(Error::message("invalid messaging retry policy".into()));
         }
         Ok(())
     }
@@ -154,12 +195,60 @@ pub trait OutboxStore {
 }
 
 /// Transport failure classification; uncertain acceptance must remain retryable.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(display("{source}"))]
 pub struct SendError {
-    /// Human-readable failure, including acceptance uncertainty when applicable.
-    pub detail: String,
-    /// Only set for definitive permanent rejection. Never set for a lost ack.
-    pub permanent: bool,
+    source: pactum_errors::Diagnostic,
+}
+impl SendError {
+    /// Definitive rejection before acceptance, safe to dead-letter.
+    pub fn rejected(detail: String) -> Self {
+        Self {
+            source: pactum_errors::Diagnostic::message(pactum_errors::ErrorCode::Rejected, detail),
+        }
+    }
+    /// Acceptance is unknown; only the same immutable message may be retried.
+    pub fn unknown(detail: String) -> Self {
+        Self {
+            source: pactum_errors::Diagnostic::message(
+                pactum_errors::ErrorCode::TransportUnknown,
+                detail,
+            ),
+        }
+    }
+    /// Preserve a typed transport source. A failed send never proves rejection.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: pactum_errors::Diagnostic::caused(
+                pactum_errors::ErrorCode::TransportUnknown,
+                source,
+            ),
+        }
+    }
+    /// Preserve an elapsed send deadline; transport acceptance is still unknown.
+    pub fn timeout(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            source: pactum_errors::Diagnostic::caused(pactum_errors::ErrorCode::Timeout, source),
+        }
+    }
+    /// Only a definitive rejection may be treated as permanent non-acceptance.
+    pub fn permanent(&self) -> bool {
+        self.source.code() == pactum_errors::ErrorCode::Rejected
+    }
+    /// Stable code.
+    pub fn code(&self) -> pactum_errors::ErrorCode {
+        self.source.code()
+    }
+    /// Structured local diagnostic, including original typed source.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
+    }
+    /// Attach the immutable message identity and safe dispatch phase.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
 }
 /// Broker-neutral sender. Success must mean durable acceptance by the adapter's
 /// destination. Forward stable IDs unchanged. Cancellation/timeouts can happen
@@ -210,25 +299,26 @@ impl Dispatcher {
             || self.lease_ms <= 0
             || self.send_timeout.is_zero()
         {
-            return Err(Error("invalid dispatcher bounds".into()));
+            return Err(Error::message("invalid dispatcher bounds".into()));
         }
         let claims = store.claim(clock(), self.lease_ms, self.batch_size)?;
         let mut report = DispatchReport::default();
         for claim in claims {
             let result = tokio::time::timeout(self.send_timeout, transport.send(&claim.message))
                 .await
-                .unwrap_or_else(|_| {
-                    Err(SendError {
-                        detail: "send timeout: acceptance unknown".into(),
-                        permanent: false,
-                    })
-                });
+                .unwrap_or_else(|error| Err(SendError::timeout(error)));
             match result {
                 Ok(()) => {
                     store.acknowledge(&claim)?;
                     report.delivered += 1;
                 }
                 Err(failure) => {
+                    let failure = failure.with_context(pactum_errors::ErrorContext {
+                        transaction: Some(claim.message.id.clone()),
+                        phase: Some("outbox_send".into()),
+                        ..Default::default()
+                    });
+                    failure.diagnostic().trace();
                     store.fail(&claim, clock(), &failure)?;
                     report.failed += 1;
                 }
@@ -314,20 +404,13 @@ pub struct FakeTransport {
 impl Transport for FakeTransport {
     async fn send(&mut self, message: &Message) -> Result<(), SendError> {
         match self.faults.pop_front() {
-            Some(Fault::Partition | Fault::Drop) => Err(SendError {
-                detail: "not accepted (partition/drop)".into(),
-                permanent: false,
-            }),
-            Some(Fault::Reject) => Err(SendError {
-                detail: "permanent rejection".into(),
-                permanent: true,
-            }),
+            Some(Fault::Partition | Fault::Drop) => {
+                Err(SendError::unknown("not accepted (partition/drop)".into()))
+            }
+            Some(Fault::Reject) => Err(SendError::rejected("permanent rejection".into())),
             Some(Fault::LoseAck) => {
                 self.deliveries.push_back(message.clone());
-                Err(SendError {
-                    detail: "accepted; acknowledgement lost".into(),
-                    permanent: false,
-                })
+                Err(SendError::unknown("accepted; acknowledgement lost".into()))
             }
             fault => {
                 self.deliveries.push_back(message.clone());

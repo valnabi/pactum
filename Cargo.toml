@@ -10,6 +10,9 @@ repository = "https://github.com/valnabi/pactum"
 publish = false
 
 [workspace.dependencies]
+pactum-errors = { path = "crates/pactum-errors" }
+snafu = "0.9.2"
+tracing = "0.1.44"
 pactum-journal = { path = "crates/pactum-journal" }
 pactum-core = { path = "crates/pactum-core" }
 pactum-sqlite = { path = "crates/pactum-sqlite" }

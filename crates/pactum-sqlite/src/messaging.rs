@@ -7,8 +7,14 @@ use pactum_messaging::{
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::{path::Path, time::Duration};
 
-fn error(e: impl std::fmt::Display) -> Error {
-    Error(e.to_string())
+fn error(e: impl Into<crate::AdapterError>) -> Error {
+    Error::from_diagnostic(e.into().diagnostic())
+}
+fn corrupt(detail: &str) -> Error {
+    Error::from_diagnostic(pactum_errors::Diagnostic::message(
+        pactum_errors::ErrorCode::CorruptHistory,
+        detail.into(),
+    ))
 }
 fn bytes(message: &Message) -> Result<Vec<u8>, Error> {
     message.validate()?;
@@ -26,10 +32,10 @@ fn state(value: &str) -> Result<DeliveryState, Error> {
         "leased" => Ok(DeliveryState::Leased),
         "delivered" => Ok(DeliveryState::Delivered),
         "dead" => Ok(DeliveryState::Dead),
-        _ => Err(error("invalid delivery state")),
+        _ => Err(corrupt("invalid delivery state")),
     }
 }
-type DeliveryRow = (Vec<u8>, String, u32, i64, Option<String>);
+type DeliveryRow = (Vec<u8>, String, u32, i64, Option<String>, Option<String>);
 fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRow> {
     Ok((
         row.get(0)?,
@@ -37,17 +43,39 @@ fn decode_delivery(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRow> {
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 fn delivery(row: DeliveryRow) -> Result<Delivery, Error> {
     let message: Message = serde_json::from_slice(&row.0).map_err(error)?;
-    message.validate()?;
+    message
+        .validate()
+        .map_err(|source| Error::classified(pactum_errors::ErrorCode::CorruptHistory, source))?;
+    let mut failure = row
+        .5
+        .as_deref()
+        .map(serde_json::from_str::<pactum_errors::FailureMetadata>)
+        .transpose()
+        .map_err(error)?;
+    if let Some(failure) = &mut failure {
+        if !failure.is_valid() {
+            return Err(Error::from_diagnostic(pactum_errors::Diagnostic::message(
+                pactum_errors::ErrorCode::CorruptHistory,
+                "invalid outbox failure metadata".into(),
+            )));
+        }
+        failure
+            .context
+            .transaction
+            .get_or_insert_with(|| message.id.clone());
+    }
     Ok(Delivery {
         message,
         state: state(&row.1)?,
         attempts: row.2,
         available_at: row.3,
         last_error: row.4,
+        failure,
     })
 }
 
@@ -64,7 +92,7 @@ impl SqliteMessaging {
     }
     /// Adopt an application's connection. No transaction may already be active.
     /// Configures and verifies WAL/FULL and installs versioned messaging tables.
-    pub fn from_connection(connection: Connection) -> Result<Self, Error> {
+    pub fn from_connection(mut connection: Connection) -> Result<Self, Error> {
         if !connection.is_autocommit() {
             return Err(error("connection has an active transaction"));
         }
@@ -83,21 +111,24 @@ impl SqliteMessaging {
         if mode != "wal" || sync != 2 {
             return Err(error("messaging requires WAL/FULL on a file database"));
         }
-        connection.execute_batch("BEGIN IMMEDIATE;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(error)?;
+        tx.execute_batch("
             CREATE TABLE IF NOT EXISTS pactum_message_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL);
             INSERT OR IGNORE INTO pactum_message_meta VALUES(1,1);
-            COMMIT;").map_err(error)?;
-        let version: u32 = connection
+            ").map_err(error)?;
+        let version: u32 = tx
             .query_row(
                 "SELECT version FROM pactum_message_meta WHERE singleton=1",
                 [],
                 |r| r.get(0),
             )
             .map_err(error)?;
-        if version != 1 {
-            return Err(error("unsupported messaging schema"));
+        if !matches!(version, 1 | 2) {
+            return Err(corrupt("unsupported messaging schema"));
         }
-        connection.execute_batch("BEGIN IMMEDIATE;
+        tx.execute_batch("
             CREATE TABLE IF NOT EXISTS pactum_outbox(
                 id TEXT PRIMARY KEY, envelope BLOB NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','leased','delivered','dead')),
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 4294967295),
@@ -115,7 +146,14 @@ impl SqliteMessaging {
                 watermark INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(consumer,key));
             CREATE TABLE IF NOT EXISTS pactum_stream_slots(consumer TEXT NOT NULL, key TEXT NOT NULL,
                 sequence INTEGER NOT NULL, id TEXT NOT NULL, PRIMARY KEY(consumer,key,sequence));
-            COMMIT;").map_err(error)?;
+            ").map_err(error)?;
+        if version == 1 {
+            tx.execute_batch("ALTER TABLE pactum_outbox ADD COLUMN last_failure TEXT; UPDATE pactum_message_meta SET version=2 WHERE singleton=1;").map_err(error)?;
+        }
+        // Validate the required v2 column even when a database claims that version.
+        tx.prepare("SELECT last_failure FROM pactum_outbox LIMIT 0")
+            .map_err(error)?;
+        tx.commit().map_err(error)?;
         Ok(Self { connection })
     }
     /// Application access for schema setup and reads. Do not alter messaging
@@ -190,7 +228,7 @@ impl SqliteMessaging {
         if limit == 0 || limit > 10_000 {
             return Err(error("invalid inspection limit"));
         }
-        let mut query = self.connection.prepare("SELECT envelope,state,attempts,available_at,last_error FROM pactum_outbox WHERE id>?1 ORDER BY id LIMIT ?2").map_err(error)?;
+        let mut query = self.connection.prepare("SELECT envelope,state,attempts,available_at,last_error,last_failure FROM pactum_outbox WHERE id>?1 ORDER BY id LIMIT ?2").map_err(error)?;
         query
             .query_map(params![after, limit as i64], decode_delivery)
             .map_err(error)?
@@ -218,7 +256,7 @@ impl SqliteMessaging {
                 "applied" => ConsumeResult::Duplicate,
                 "pending" => ConsumeResult::Retry(detail.unwrap_or_default()),
                 "dead" => ConsumeResult::Dead(detail.unwrap_or_default()),
-                _ => return Err(error("invalid inbox state")),
+                _ => return Err(corrupt("invalid inbox state")),
             };
             Ok((result, attempts))
         })
@@ -241,8 +279,23 @@ impl OutboxStore for SqliteMessaging {
             .map_err(error)?;
         // Expired sends may already have been accepted. Never label them delivered;
         // budget exhaustion retains an explicit uncertain dead letter instead.
-        tx.execute("UPDATE pactum_outbox SET state='dead',last_error='claim budget exhausted; acceptance may be unknown' WHERE id IN
-            (SELECT id FROM pactum_outbox WHERE state IN ('pending','leased') AND available_at<=?1 AND (cycle_attempts>=max_attempts OR attempts=4294967295) ORDER BY available_at,id LIMIT ?2)",params![now,limit as i64]).map_err(error)?;
+        let expired = pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::OperatorRequired,
+            "claim budget exhausted; acceptance may be unknown".into(),
+        )
+        .with_context(pactum_errors::ErrorContext {
+            phase: Some("outbox_send".into()),
+            operation: Some("claim_expired".into()),
+            ..Default::default()
+        })
+        .metadata(pactum_errors::RetryContext {
+            authority_valid: true,
+            idempotent: true,
+            ..Default::default()
+        });
+        let expired = serde_json::to_string(&expired).map_err(error)?;
+        tx.execute("UPDATE pactum_outbox SET state='dead',last_error='claim budget exhausted; acceptance may be unknown',last_failure=?3 WHERE id IN
+            (SELECT id FROM pactum_outbox WHERE state IN ('pending','leased') AND available_at<=?1 AND (cycle_attempts>=max_attempts OR attempts=4294967295) ORDER BY available_at,id LIMIT ?2)",params![now,limit as i64,expired]).map_err(error)?;
         let mut query = tx.prepare("SELECT envelope,attempts FROM pactum_outbox WHERE state IN ('pending','leased') AND available_at<=?1 AND cycle_attempts<max_attempts AND attempts<4294967295 ORDER BY available_at,id LIMIT ?2").map_err(error)?;
         let rows = query
             .query_map(params![now, limit as i64], |r| {
@@ -255,7 +308,9 @@ impl OutboxStore for SqliteMessaging {
         let mut claims = Vec::new();
         for (envelope, attempts) in rows {
             let message: Message = serde_json::from_slice(&envelope).map_err(error)?;
-            message.validate()?;
+            message.validate().map_err(|source| {
+                Error::classified(pactum_errors::ErrorCode::CorruptHistory, source)
+            })?;
             tx.execute("UPDATE pactum_outbox SET state='leased',attempts=attempts+1,cycle_attempts=cycle_attempts+1,available_at=?2 WHERE id=?1",params![message.id,until]).map_err(error)?;
             claims.push(Claim {
                 message,
@@ -266,9 +321,12 @@ impl OutboxStore for SqliteMessaging {
         Ok(claims)
     }
     fn acknowledge(&mut self, claim: &Claim) -> Result<(), Error> {
-        let changed = self.connection.execute("UPDATE pactum_outbox SET state='delivered',last_error=NULL WHERE id=?1 AND state='leased' AND attempts=?2",params![claim.message.id,claim.token]).map_err(error)?;
+        let changed = self.connection.execute("UPDATE pactum_outbox SET state='delivered',last_error=NULL,last_failure=NULL WHERE id=?1 AND state='leased' AND attempts=?2",params![claim.message.id,claim.token]).map_err(error)?;
         if changed != 1 {
-            return Err(error("obsolete outbox claim"));
+            return Err(Error::from_diagnostic(pactum_errors::Diagnostic::message(
+                pactum_errors::ErrorCode::StaleOwner,
+                "obsolete outbox claim".into(),
+            )));
         }
         Ok(())
     }
@@ -278,7 +336,7 @@ impl OutboxStore for SqliteMessaging {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(error)?;
-        let (attempt, max_attempts, backoff_ms, max_backoff_ms): (u32,u32,i64,i64) = tx.query_row("SELECT cycle_attempts,max_attempts,backoff,max_backoff FROM pactum_outbox WHERE id=?1 AND state='leased' AND attempts=?2",params![claim.message.id,claim.token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(error)?;
+        let (attempt, max_attempts, backoff_ms, max_backoff_ms): (u32,u32,i64,i64) = tx.query_row("SELECT cycle_attempts,max_attempts,backoff,max_backoff FROM pactum_outbox WHERE id=?1 AND state='leased' AND attempts=?2",params![claim.message.id,claim.token], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(error)?.ok_or_else(|| Error::from_diagnostic(pactum_errors::Diagnostic::message(pactum_errors::ErrorCode::StaleOwner, "obsolete outbox claim".into()).with_context(pactum_errors::ErrorContext { transaction: Some(claim.message.id.clone()), phase: Some("outbox_send".into()), operation: Some("fail_claim".into()), ..Default::default() })))?;
         let policy = RetryPolicy {
             max_attempts,
             backoff_ms,
@@ -286,24 +344,42 @@ impl OutboxStore for SqliteMessaging {
         };
         policy.validate()?;
         let next = now.saturating_add(policy.delay(attempt));
+        let mut metadata = failure
+            .diagnostic()
+            .clone()
+            .with_context(pactum_errors::ErrorContext {
+                transaction: Some(claim.message.id.clone()),
+                phase: Some("outbox_send".into()),
+                ..Default::default()
+            })
+            .metadata(pactum_errors::RetryContext {
+                authority_valid: true,
+                idempotent: true,
+                ..Default::default()
+            });
+        if attempt >= max_attempts && !failure.permanent() {
+            metadata.disposition = pactum_errors::RetryDisposition::OperatorIntervention;
+        }
+        let metadata = serde_json::to_string(&metadata).map_err(error)?;
         tx.execute(
-            "UPDATE pactum_outbox SET state=?2,available_at=?3,last_error=?4 WHERE id=?1",
+            "UPDATE pactum_outbox SET state=?2,available_at=?3,last_error=?4,last_failure=?5 WHERE id=?1",
             params![
                 claim.message.id,
-                if failure.permanent || attempt >= max_attempts {
+                if failure.permanent() || attempt >= max_attempts {
                     "dead"
                 } else {
                     "pending"
                 },
                 next,
-                failure.detail
+                failure.code().as_str(),
+                metadata,
             ],
         )
         .map_err(error)?;
         tx.commit().map_err(error)
     }
     fn delivery(&self, id: &str) -> Result<Option<Delivery>, Error> {
-        self.connection.query_row("SELECT envelope,state,attempts,available_at,last_error FROM pactum_outbox WHERE id=?1",[id],decode_delivery).optional().map_err(error)?.map(delivery).transpose()
+        self.connection.query_row("SELECT envelope,state,attempts,available_at,last_error,last_failure FROM pactum_outbox WHERE id=?1",[id],decode_delivery).optional().map_err(error)?.map(delivery).transpose()
     }
     fn replay(&mut self, id: &str, now: i64) -> Result<(), Error> {
         time(now)?;
@@ -371,7 +447,7 @@ impl InboxStore for SqliteMessaging {
             return Ok(ConsumeResult::Dead(detail.unwrap_or_default()));
         }
         if s != "pending" {
-            return Err(error("invalid inbox state"));
+            return Err(corrupt("invalid inbox state"));
         }
         if ordering == OrderingPolicy::Strict {
             let key = message.ordering_key.as_deref().expect("validated key");
@@ -422,11 +498,11 @@ impl InboxStore for SqliteMessaging {
                 tx.execute_batch("ROLLBACK TO pactum_inbox_effect; RELEASE pactum_inbox_effect")
                     .map_err(error)?;
                 let dead = attempts + 1 >= budget;
-                tx.execute("UPDATE pactum_inbox SET state=?3,attempts=attempts+1,last_error=?4 WHERE consumer=?1 AND id=?2",params![consumer,message.id,if dead {"dead"} else {"pending"},failure.0]).map_err(error)?;
+                tx.execute("UPDATE pactum_inbox SET state=?3,attempts=attempts+1,last_error=?4 WHERE consumer=?1 AND id=?2",params![consumer,message.id,if dead {"dead"} else {"pending"},failure.safe_detail().to_string()]).map_err(error)?;
                 if dead {
-                    ConsumeResult::Dead(failure.0)
+                    ConsumeResult::Dead(failure.safe_detail().to_string())
                 } else {
-                    ConsumeResult::Retry(failure.0)
+                    ConsumeResult::Retry(failure.safe_detail().to_string())
                 }
             }
         };

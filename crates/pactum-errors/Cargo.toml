@@ -1,0 +1,19 @@
+[package]
+name = "pactum-errors"
+description = "Stable error codes, safe diagnostic context and recovery classification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+snafu.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -45,7 +45,7 @@ macro_rules! identifier {
             pub fn new(value: impl Into<String>) -> Result<Self, Error> {
                 let value = value.into();
                 if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
-                    return Err(Error::Invalid(
+                    return Err(Error::invalid(
                         "identifier must be 1..=256 bytes without controls".into(),
                     ));
                 }
@@ -128,14 +128,51 @@ pub enum ParticipantStatus {
 }
 
 /// Participant transport/resource failure (including ambiguous completion).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParticipantError(pub String);
-impl fmt::Display for ParticipantError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct ParticipantError {
+    source: pactum_errors::Diagnostic,
+}
+impl ParticipantError {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::AdapterUnknown,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::AdapterUnknown, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
     }
 }
-impl std::error::Error for ParticipantError {}
+impl std::ops::Deref for ParticipantError {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
 
 /// Durable, idempotent resource adapter. All calls use the transaction as their
 /// idempotency key. Duplicate prepare must verify the same payload and token;
@@ -164,21 +201,146 @@ pub trait Participant: Send + Sync {
 
 /// Engine errors. Journal uncertainty always requires dropping and reopening the
 /// coordinator and journal; do not interpret it as a failed/aborted transaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub use pactum_errors::{
+    DecisionAdvice, DecisionState, Diagnostic, ErrorCode, ErrorContext, ErrorPhase, FailureClass,
+    RetryContext, RetryDisposition,
+};
+
+/// Layered engine errors; variants describe the failed call, never a final outcome.
+#[derive(Debug, Clone, PartialEq, Eq, snafu::Snafu)]
+#[snafu(module)]
 pub enum Error {
-    /// Invalid input or registration.
-    Invalid(String),
-    /// Journal schema or protocol history violates the state machine.
-    Corrupt(String),
-    /// Durability is uncertain. No further finalization is dispatched.
-    InDoubt(String),
+    /// Invalid immutable input or configuration; never a transaction abort result.
+    #[snafu(display("{source}"))]
+    Invalid {
+        /// Structured cause.
+        source: Diagnostic,
+    },
+    /// Invalid durable history; automatic dispatch must stop.
+    #[snafu(display("{source}"))]
+    Corrupt {
+        /// Structured cause.
+        source: Diagnostic,
+    },
+    /// Ambiguous journal durability; drop/reopen before further decisions.
+    #[snafu(display("{source}"))]
+    InDoubt {
+        /// Structured cause.
+        source: Diagnostic,
+    },
+    /// Classified adapter, ownership or recovery failure.
+    #[snafu(display("{source}"))]
+    Operational {
+        /// Structured cause.
+        source: Diagnostic,
+    },
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+impl Error {
+    /// Safe validation message. Display is not a stable contract.
+    pub fn invalid(detail: String) -> Self {
+        Self::Invalid {
+            source: Diagnostic::message(ErrorCode::InvalidInput, detail),
+        }
+    }
+    /// Safe durable history invariant message.
+    pub fn corrupt(detail: String) -> Self {
+        Self::Corrupt {
+            source: Diagnostic::message(ErrorCode::CorruptHistory, detail),
+        }
+    }
+    /// Safe journal uncertainty message.
+    pub fn in_doubt(detail: String) -> Self {
+        Self::InDoubt {
+            source: Diagnostic::message(ErrorCode::DurabilityUnknown, detail),
+        }
+    }
+    /// Preserve a validation source without logging its text.
+    pub fn invalid_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Invalid {
+            source: Diagnostic::caused(ErrorCode::InvalidInput, source),
+        }
+    }
+    /// Preserve a replay source without treating its Display as protocol history.
+    pub fn corrupt_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Corrupt {
+            source: Diagnostic::caused(ErrorCode::CorruptHistory, source),
+        }
+    }
+    /// Preserve an ambiguous write source. No final decision may be inferred.
+    pub fn in_doubt_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::InDoubt {
+            source: Diagnostic::caused(ErrorCode::DurabilityUnknown, source),
+        }
+    }
+    /// Annotate an actual journal write boundary, retaining stale-owner codes.
+    pub fn journal(source: pactum_journal::JournalError, operation: &str) -> Self {
+        let code = if source.code() == ErrorCode::StaleOwner {
+            ErrorCode::StaleOwner
+        } else {
+            ErrorCode::DurabilityUnknown
+        };
+        let context = source.context().clone();
+        Self::InDoubt {
+            source: Diagnostic::caused(code, source)
+                .with_context(context)
+                .with_context(ErrorContext::operation(operation)),
+        }
+    }
+    /// Preserve the actual storage/fencing code at a read-only journal boundary.
+    /// A failed read alone does not establish corrupt history or a transaction outcome.
+    pub fn journal_read(source: pactum_journal::JournalError, operation: &str) -> Self {
+        let code = source.code();
+        let context = source.context().clone();
+        let source = Diagnostic::caused(code, source)
+            .with_context(context)
+            .with_context(ErrorContext {
+                phase: Some("journal_read".into()),
+                operation: Some(operation.into()),
+                ..Default::default()
+            });
+        if code == ErrorCode::CorruptHistory {
+            Self::Corrupt { source }
+        } else {
+            Self::Operational { source }
+        }
+    }
+    /// Wrap a classified failure at an adapter/authority/recovery boundary.
+    pub fn operational(source: Diagnostic) -> Self {
+        Self::Operational { source }
+    }
+    /// Inspect stable code and structured context.
+    pub fn diagnostic(&self) -> &Diagnostic {
+        match self {
+            Self::Invalid { source }
+            | Self::Corrupt { source }
+            | Self::InDoubt { source }
+            | Self::Operational { source } => source,
+        }
+    }
+    /// Add structured boundary identifiers.
+    pub fn with_context(self, context: ErrorContext) -> Self {
+        match self {
+            Self::Invalid { source } => Self::Invalid {
+                source: source.with_context(context),
+            },
+            Self::Corrupt { source } => Self::Corrupt {
+                source: source.with_context(context),
+            },
+            Self::InDoubt { source } => Self::InDoubt {
+                source: source.with_context(context),
+            },
+            Self::Operational { source } => Self::Operational {
+                source: source.with_context(context),
+            },
+        }
     }
 }
-impl std::error::Error for Error {}
+impl std::ops::Deref for Error {
+    type Target = Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        self.diagnostic()
+    }
+}
 
 /// Completion known from durable coordinator acknowledgements.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +353,21 @@ pub enum Outcome {
     InDoubt,
 }
 
+/// Unambiguous transaction knowledge, separate from a failed operational call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionOutcome {
+    /// Durable commit and all final acknowledgements.
+    Committed,
+    /// Durable abort and all final acknowledgements.
+    Aborted,
+    /// Durable decision exists; delivery still needs recovery.
+    PendingRecovery {
+        /// Decision that recovery must retain.
+        decision: Decision,
+    },
+    /// No durable decision is known, including after an ambiguous journal write.
+    Unknown,
+}
 /// Observable coordinator phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -218,8 +395,41 @@ pub struct Status {
     pub pending: Vec<ParticipantId>,
     /// Latest local operation error; not a durable diagnostic log.
     pub last_error: Option<String>,
+    /// Process-local typed failure; source chains are never journaled.
+    pub diagnostic: Option<pactum_errors::Diagnostic>,
 }
 
+impl Status {
+    /// Read transaction knowledge from durable status, never from Error alone.
+    pub fn transaction_outcome(&self) -> TransactionOutcome {
+        match self.outcome {
+            Outcome::Committed => TransactionOutcome::Committed,
+            Outcome::Aborted => TransactionOutcome::Aborted,
+            Outcome::InDoubt => match self.decision {
+                Some(decision) => TransactionOutcome::PendingRecovery { decision },
+                None => TransactionOutcome::Unknown,
+            },
+        }
+    }
+    /// Classification context for an existing idempotent reconciliation call.
+    pub fn retry_context(&self) -> RetryContext {
+        RetryContext {
+            phase: if self.decision.is_some() {
+                ErrorPhase::Finalize
+            } else {
+                ErrorPhase::Prepare
+            },
+            decision: match self.decision {
+                Some(Decision::Commit) => DecisionState::Commit,
+                Some(Decision::Abort) => DecisionState::Abort,
+                None => DecisionState::Undecided,
+            },
+            authority_valid: true,
+            idempotent: true,
+            journal_write: false,
+        }
+    }
+}
 /// Bounded per-operation retry settings. Attempts must be positive.
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {
@@ -295,6 +505,7 @@ struct State {
     decision: Option<Decision>,
     acknowledged: BTreeSet<ParticipantId>,
     last_error: Option<String>,
+    diagnostic: Option<pactum_errors::Diagnostic>,
 }
 fn validate_requests(requests: &[Enlistment]) -> Result<(), Error> {
     if requests.is_empty()
@@ -302,16 +513,16 @@ fn validate_requests(requests: &[Enlistment]) -> Result<(), Error> {
             .windows(2)
             .any(|w| w[0].participant >= w[1].participant)
     {
-        return Err(Error::Invalid(
+        return Err(Error::invalid(
             "enlist at least one resource, sorted uniquely by identity".into(),
         ));
     }
     Ok(())
 }
 fn apply(states: &mut BTreeMap<TransactionId, State>, record: Record) -> Result<(), Error> {
-    let corrupt = || Error::Corrupt("illegal transaction transition".into());
+    let corrupt = || Error::corrupt("illegal transaction transition".into());
     if let Record::Begin { tx, requests } = record {
-        validate_requests(&requests).map_err(|e| Error::Corrupt(e.to_string()))?;
+        validate_requests(&requests).map_err(Error::corrupt_source)?;
         if states.contains_key(&tx) {
             return Err(corrupt());
         }
@@ -323,6 +534,7 @@ fn apply(states: &mut BTreeMap<TransactionId, State>, record: Record) -> Result<
                 decision: None,
                 acknowledged: BTreeSet::new(),
                 last_error: None,
+                diagnostic: None,
             },
         );
         return Ok(());
@@ -407,7 +619,7 @@ impl<J: Journal> Coordinator<J> {
         policy: RetryPolicy,
     ) -> Result<Self, Error> {
         if policy.attempts == 0 || policy.timeout.is_zero() {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "positive attempts and timeout required".into(),
             ));
         }
@@ -415,15 +627,15 @@ impl<J: Journal> Coordinator<J> {
         let mut durable_sequence = 0;
         if let Some(checkpoint) = journal
             .checkpoint()
-            .map_err(|e| Error::Corrupt(e.to_string()))?
+            .map_err(|source| Error::journal_read(source, "checkpoint"))?
         {
             if checkpoint.version != 1 {
-                return Err(Error::Corrupt("unsupported 2PC checkpoint".into()));
+                return Err(Error::corrupt("unsupported 2PC checkpoint".into()));
             }
-            let records: Vec<Record> = serde_json::from_slice(&checkpoint.payload)
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            let records: Vec<Record> =
+                serde_json::from_slice(&checkpoint.payload).map_err(Error::corrupt_source)?;
             if records.len() as u64 > checkpoint.watermark {
-                return Err(Error::Corrupt("checkpoint exceeds watermark".into()));
+                return Err(Error::corrupt("checkpoint exceeds watermark".into()));
             }
             for record in records {
                 apply(&mut states, record)?;
@@ -433,18 +645,20 @@ impl<J: Journal> Coordinator<J> {
         journal
             .visit(&mut |entry| {
                 if Some(entry.sequence) != durable_sequence.checked_add(1) || entry.version != 1 {
-                    return Err(pactum_journal::JournalError(
+                    return Err(pactum_journal::JournalError::corrupt(
                         "sequence gap or unsupported protocol version".into(),
                     ));
                 }
-                let record = serde_json::from_slice(&entry.payload)
-                    .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
-                apply(&mut states, record)
-                    .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
+                let record = serde_json::from_slice(&entry.payload).map_err(|e| {
+                    pactum_journal::JournalError::classified(crate::ErrorCode::CorruptHistory, e)
+                })?;
+                apply(&mut states, record).map_err(|e| {
+                    pactum_journal::JournalError::classified(crate::ErrorCode::CorruptHistory, e)
+                })?;
                 durable_sequence = entry.sequence;
                 Ok(())
             })
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+            .map_err(|source| Error::journal_read(source, "replay"))?;
         let mut coordinator = Self {
             journal,
             participants: BTreeMap::new(),
@@ -495,11 +709,11 @@ impl<J: Journal> Coordinator<J> {
                 });
             }
         }
-        let payload = serde_json::to_vec(&records).map_err(|e| Error::Invalid(e.to_string()))?;
+        let payload = serde_json::to_vec(&records).map_err(Error::invalid_source)?;
         self.poisoned = true;
         self.journal
             .compact(self.durable_sequence, 1, &payload, retention)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+            .map_err(|e| Error::journal(e, "compact"))?;
         self.poisoned = false;
         Ok(())
     }
@@ -507,14 +721,14 @@ impl<J: Journal> Coordinator<J> {
     pub fn register(&mut self, participant: Arc<dyn Participant>) -> Result<(), Error> {
         let id = participant.id();
         if self.participants.contains_key(&id) {
-            return Err(Error::Invalid(format!("duplicate participant: {id}")));
+            return Err(Error::invalid(format!("duplicate participant: {id}")));
         }
         self.participants.insert(id, participant);
         Ok(())
     }
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
-            Err(Error::InDoubt(
+            Err(Error::in_doubt(
                 "journal uncertainty; drop and reopen".into(),
             ))
         } else {
@@ -535,21 +749,37 @@ impl<J: Journal> Coordinator<J> {
             next.insert(tx.clone(), state.clone());
         }
         apply(&mut next, record.clone())?;
-        let bytes = serde_json::to_vec(&record).map_err(|e| Error::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(&record).map_err(Error::invalid_source)?;
+        let context = ErrorContext {
+            transaction: Some(tx.as_str().into()),
+            phase: Some(
+                match &record {
+                    Record::Begin { .. } => "begin",
+                    Record::Prepared { .. } => "prepare",
+                    Record::Decided { .. } => "decision",
+                    Record::Acknowledged { .. } => "acknowledge",
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
         // No await between append, barrier, and publishing state.
         self.poisoned = true;
-        let sequence = self
-            .journal
-            .append(1, &bytes)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
-        let durable = self
-            .journal
-            .flush()
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        let sequence = self.journal.append(1, &bytes).map_err(|e| {
+            let error = Error::journal(e, "append").with_context(context.clone());
+            error.trace();
+            error
+        })?;
+        let durable = self.journal.flush().map_err(|e| {
+            let error = Error::journal(e, "flush").with_context(context.clone());
+            error.trace();
+            error
+        })?;
         if Some(sequence) != self.durable_sequence.checked_add(1) || durable != sequence {
-            return Err(Error::InDoubt(
-                "barrier did not cover appended record".into(),
-            ));
+            return Err(
+                Error::in_doubt("barrier did not cover appended record".into())
+                    .with_context(context),
+            );
         }
         let state = next
             .remove(&tx)
@@ -608,6 +838,7 @@ impl<J: Journal> Coordinator<J> {
                 decision: s.decision,
                 pending,
                 last_error: s.last_error.clone(),
+                diagnostic: s.diagnostic.clone(),
             }
         }))
     }
@@ -625,7 +856,7 @@ impl<J: Journal> Coordinator<J> {
         validate_requests(&requests)?;
         if let Some(state) = self.states.get(&tx) {
             if state.requests != requests {
-                return Err(Error::Invalid(
+                return Err(Error::invalid(
                     "transaction ID reused for different work".into(),
                 ));
             }
@@ -635,7 +866,7 @@ impl<J: Journal> Coordinator<J> {
             .iter()
             .any(|r| !self.participants.contains_key(&r.participant))
         {
-            return Err(Error::Invalid("unregistered participant".into()));
+            return Err(Error::invalid("unregistered participant".into()));
         }
         self.persist(Record::Begin {
             tx: tx.clone(),
@@ -658,8 +889,26 @@ impl<J: Journal> Coordinator<J> {
                 }
                 other => {
                     decision = Decision::Abort;
-                    self.states.get_mut(&tx).unwrap().last_error =
-                        Some(format!("prepare {}: {other:?}", request.participant));
+                    let diagnostic = match other {
+                        Err(e) => e.diagnostic().clone(),
+                        Ok(Vote::Rejected(_)) => {
+                            Diagnostic::message(ErrorCode::Rejected, "prepare refused".into())
+                        }
+                        Ok(Vote::Prepared(_)) => Diagnostic::message(
+                            ErrorCode::ProtocolMismatch,
+                            "prepare returned an invalid token".into(),
+                        ),
+                    }
+                    .with_context(ErrorContext {
+                        transaction: Some(tx.as_str().into()),
+                        participant: Some(request.participant.as_str().into()),
+                        phase: Some("prepare".into()),
+                        ..ErrorContext::default()
+                    });
+                    diagnostic.trace();
+                    let state = self.states.get_mut(&tx).unwrap();
+                    state.last_error = Some(diagnostic.to_string());
+                    state.diagnostic = Some(diagnostic);
                     break;
                 }
             }
@@ -721,13 +970,32 @@ impl<J: Journal> Coordinator<J> {
             .expect("finalize requires durable decision");
         for id in snapshot.pending {
             if cancellation.is_cancelled() {
-                self.states.get_mut(tx).unwrap().last_error =
-                    Some("cancelled; durable decision retained".into());
+                let diagnostic = Diagnostic::message(
+                    ErrorCode::Cancelled,
+                    "cancelled; durable decision retained".into(),
+                )
+                .with_context(ErrorContext {
+                    transaction: Some(tx.as_str().into()),
+                    phase: Some("finalize".into()),
+                    ..Default::default()
+                });
+                let state = self.states.get_mut(tx).unwrap();
+                state.last_error = Some(diagnostic.to_string());
+                state.diagnostic = Some(diagnostic);
                 break;
             }
             let Some(participant) = self.participants.get(&id).cloned() else {
-                self.states.get_mut(tx).unwrap().last_error =
-                    Some(format!("participant unavailable: {id}"));
+                let state = self.states.get_mut(tx).unwrap();
+                let diagnostic =
+                    Diagnostic::message(ErrorCode::Unavailable, "participant unavailable".into())
+                        .with_context(ErrorContext {
+                            transaction: Some(tx.as_str().into()),
+                            participant: Some(id.as_str().into()),
+                            phase: Some("finalize".into()),
+                            ..Default::default()
+                        });
+                state.last_error = Some(diagnostic.to_string());
+                state.diagnostic = Some(diagnostic);
                 continue;
             };
             let token = self.states[tx].prepared.get(&id).cloned();
@@ -748,13 +1016,28 @@ impl<J: Journal> Coordinator<J> {
                     participant: id,
                 })?,
                 Err(e) => {
-                    self.states.get_mut(tx).unwrap().last_error =
-                        Some(format!("finalize {id}: {e}"))
+                    let diagnostic = e.diagnostic().clone().with_context(ErrorContext {
+                        transaction: Some(tx.as_str().into()),
+                        participant: Some(id.as_str().into()),
+                        phase: Some(
+                            match decision {
+                                Decision::Commit => "commit",
+                                Decision::Abort => "abort",
+                            }
+                            .into(),
+                        ),
+                        ..ErrorContext::default()
+                    });
+                    diagnostic.trace();
+                    let state = self.states.get_mut(tx).unwrap();
+                    state.last_error = Some(diagnostic.to_string());
+                    state.diagnostic = Some(diagnostic);
                 }
             }
         }
         if self.states[tx].acknowledged.len() == self.states[tx].requests.len() {
             self.states.get_mut(tx).unwrap().last_error = None;
+            self.states.get_mut(tx).unwrap().diagnostic = None;
         }
         Ok(self.status(tx)?.unwrap())
     }
@@ -763,29 +1046,40 @@ async fn retry<T, F, Fut>(
     policy: &RetryPolicy,
     cancellation: &Cancellation,
     mut operation: F,
-) -> Result<T, String>
+) -> Result<T, ParticipantError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ParticipantError>>,
 {
-    let mut last = String::new();
+    let mut last = ParticipantError::message("participant retry budget exhausted".into());
     for attempt in 0..policy.attempts {
         if cancellation.is_cancelled() {
-            return Err("cancelled".into());
+            return Err(ParticipantError::from_diagnostic(Diagnostic::message(
+                ErrorCode::Cancelled,
+                "cancelled".into(),
+            )));
         }
         let result = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err("cancelled".into()),
+            _ = cancellation.cancelled() => return Err(ParticipantError::from_diagnostic(Diagnostic::message(ErrorCode::Cancelled, "cancelled".into()))),
             result = tokio::time::timeout(policy.timeout, operation()) => result,
         };
         match result {
             Ok(Ok(value)) => return Ok(value),
-            Ok(Err(e)) => last = e.to_string(),
-            Err(_) => last = "timeout".into(),
+            Ok(Err(e)) => {
+                if matches!(
+                    e.classification(),
+                    FailureClass::Permanent | FailureClass::OperatorActionRequired
+                ) {
+                    return Err(e);
+                }
+                last = e;
+            }
+            Err(e) => last = ParticipantError::classified(ErrorCode::Timeout, e),
         }
         if attempt + 1 < policy.attempts {
             tokio::select! {
-                _ = cancellation.cancelled() => return Err("cancelled".into()),
+                _ = cancellation.cancelled() => return Err(ParticipantError::from_diagnostic(Diagnostic::message(ErrorCode::Cancelled, "cancelled".into()))),
                 _ = tokio::time::sleep(policy.backoff) => {},
             }
         }
@@ -908,7 +1202,7 @@ mod tests {
         ] {
             assert!(matches!(
                 Coordinator::open(history(records), vec![], RetryPolicy::default()),
-                Err(Error::Corrupt(_))
+                Err(Error::Corrupt { .. })
             ));
         }
     }
@@ -942,7 +1236,7 @@ mod tests {
         };
         assert!(matches!(
             Coordinator::open(history(vec![]), vec![], policy),
-            Err(Error::Invalid(_))
+            Err(Error::Invalid { .. })
         ));
     }
 }

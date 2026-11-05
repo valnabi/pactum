@@ -4,8 +4,8 @@ use pactum_messaging::{
 };
 use pactum_sqlite::messaging::SqliteMessaging;
 
-fn error(e: impl std::fmt::Display) -> pactum_messaging::Error {
-    pactum_messaging::Error(e.to_string())
+fn error(e: impl Into<pactum_sqlite::AdapterError>) -> pactum_messaging::Error {
+    pactum_messaging::Error::from_diagnostic(e.into().diagnostic())
 }
 fn increment(tx: &rusqlite::Transaction<'_>) -> Result<(), pactum_messaging::Error> {
     tx.execute(

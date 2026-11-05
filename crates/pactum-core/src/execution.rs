@@ -115,10 +115,10 @@ impl Request {
     }
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if matches!(self, Self::Chunked(r) if r.chunks.is_empty()) {
-            return Err(Error::Invalid("at least one chunk required".into()));
+            return Err(Error::invalid("at least one chunk required".into()));
         }
         if matches!(self, Self::StagedPublish(r) if r.expected_generation >= i64::MAX as u64) {
-            return Err(Error::Invalid("publish generation exhausted".into()));
+            return Err(Error::invalid("publish generation exhausted".into()));
         }
         Ok(())
     }
@@ -251,17 +251,57 @@ pub struct OperationStatus {
     pub progress: Progress,
     /// Latest local backend failure; not a durable audit log.
     pub last_error: Option<String>,
+    /// Process-local typed failure; source chains are never journaled.
+    pub diagnostic: Option<pactum_errors::Diagnostic>,
 }
 /// Backend call failed. All errors conservatively permit an uncertain outcome;
 /// recovery retries using durable receipts. A definite rejection is a typed result.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackendError(pub String);
-impl fmt::Display for BackendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct BackendError {
+    source: pactum_errors::Diagnostic,
+}
+impl BackendError {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::AdapterUnknown,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::AdapterUnknown, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
     }
 }
-impl std::error::Error for BackendError {}
+impl std::ops::Deref for BackendError {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
 /// Native transaction has committed or definitely rolled back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitResult {
@@ -400,6 +440,7 @@ struct State {
     request: Request,
     progress: Progress,
     last_error: Option<String>,
+    diagnostic: Option<pactum_errors::Diagnostic>,
 }
 fn transition(old: &Progress, next: &Progress) -> bool {
     match (old, next) {
@@ -450,12 +491,10 @@ fn transition(old: &Progress, next: &Progress) -> bool {
     }
 }
 fn apply(states: &mut BTreeMap<OperationId, State>, record: &Record) -> Result<(), Error> {
-    let corrupt = || Error::Corrupt("illegal multi-mode transition".into());
+    let corrupt = || Error::corrupt("illegal multi-mode transition".into());
     match record {
         Record::Begin { id, request } => {
-            request
-                .validate()
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            request.validate().map_err(Error::corrupt_source)?;
             if states.contains_key(id) {
                 return Err(corrupt());
             }
@@ -465,6 +504,7 @@ fn apply(states: &mut BTreeMap<OperationId, State>, record: &Record) -> Result<(
                     request: request.clone(),
                     progress: Progress::initial(request),
                     last_error: None,
+                    diagnostic: None,
                 },
             );
         }
@@ -475,6 +515,7 @@ fn apply(states: &mut BTreeMap<OperationId, State>, record: &Record) -> Result<(
             }
             state.progress = progress.clone();
             state.last_error = None;
+            state.diagnostic = None;
         }
         Record::Header { .. } => return Err(corrupt()),
     }
@@ -488,9 +529,7 @@ struct Snapshot {
 }
 // Validate reachability from the initial state, without replaying every chunk.
 fn validate_snapshot_progress(request: &Request, progress: &Progress) -> Result<(), Error> {
-    request
-        .validate()
-        .map_err(|e| Error::Corrupt(e.to_string()))?;
+    request.validate().map_err(Error::corrupt_source)?;
     let valid = match (request, progress) {
         (Request::Atomic(_), Progress::Atomic(_)) => true,
         (Request::StagedPublish(_), Progress::StagedPublish(_)) => true,
@@ -505,7 +544,7 @@ fn validate_snapshot_progress(request: &Request, progress: &Progress) -> Result<
     if valid {
         Ok(())
     } else {
-        Err(Error::Corrupt("unreachable checkpoint progress".into()))
+        Err(Error::corrupt("unreachable checkpoint progress".into()))
     }
 }
 /// Single-owner engine for Atomic, Chunked and StagedPublish. Uses a dedicated
@@ -524,23 +563,23 @@ impl<J: Journal, B: Backend> Engine<J, B> {
     /// Open and strictly replay. Namespace/incarnation mismatch fails closed.
     pub fn open(mut journal: J, backend: B, policy: ExecutionPolicy) -> Result<Self, Error> {
         if policy.max_chunks == 0 || policy.max_unit_bytes == 0 {
-            return Err(Error::Invalid("positive execution limits required".into()));
+            return Err(Error::invalid("positive execution limits required".into()));
         }
         let mut states = BTreeMap::new();
         let mut sequence = 0;
         if let Some(checkpoint) = journal
             .checkpoint()
-            .map_err(|e| Error::Corrupt(e.to_string()))?
+            .map_err(|source| Error::journal_read(source, "checkpoint"))?
         {
             if checkpoint.version != 2 || checkpoint.watermark == 0 {
-                return Err(Error::Corrupt("unsupported multi-mode checkpoint".into()));
+                return Err(Error::corrupt("unsupported multi-mode checkpoint".into()));
             }
-            let snapshot: Snapshot = serde_json::from_slice(&checkpoint.payload)
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            let snapshot: Snapshot =
+                serde_json::from_slice(&checkpoint.payload).map_err(Error::corrupt_source)?;
             if snapshot.backend != backend.identity()
                 || snapshot.states.len() as u64 >= checkpoint.watermark
             {
-                return Err(Error::Corrupt(
+                return Err(Error::corrupt(
                     "checkpoint namespace or watermark mismatch".into(),
                 ));
             }
@@ -553,11 +592,12 @@ impl<J: Journal, B: Backend> Engine<J, B> {
                             request,
                             progress,
                             last_error: None,
+                            diagnostic: None,
                         },
                     )
                     .is_some()
                 {
-                    return Err(Error::Corrupt("duplicate checkpoint key".into()));
+                    return Err(Error::corrupt("duplicate checkpoint key".into()));
                 }
             }
             sequence = checkpoint.watermark;
@@ -565,19 +605,19 @@ impl<J: Journal, B: Backend> Engine<J, B> {
         journal.visit(&mut |entry| {
             let result = (|| {
                 if Some(entry.sequence) != sequence.checked_add(1) || entry.version != 2 {
-                    return Err(Error::Corrupt("sequence gap or unsupported multi-mode schema".into()));
+                    return Err(Error::corrupt("sequence gap or unsupported multi-mode schema".into()));
                 }
-                let record: Record = serde_json::from_slice(&entry.payload).map_err(|e| Error::Corrupt(e.to_string()))?;
+                let record: Record = serde_json::from_slice(&entry.payload).map_err(Error::corrupt_source)?;
                 if sequence == 0 {
                     if !matches!(record, Record::Header { backend: ref identity } if *identity == backend.identity()) {
-                        return Err(Error::Corrupt("backend namespace/incarnation mismatch".into()));
+                        return Err(Error::corrupt("backend namespace/incarnation mismatch".into()));
                     }
                 } else { apply(&mut states, &record)?; }
                 sequence = entry.sequence;
                 Ok(())
             })();
-            result.map_err(|e: Error| pactum_journal::JournalError(e.to_string()))
-        }).map_err(|e| Error::Corrupt(e.to_string()))?;
+            result.map_err(|source: Error| pactum_journal::JournalError::classified(source.code(), source))
+        }).map_err(|source| Error::journal_read(source, "replay"))?;
         let mut engine = Self {
             journal,
             backend,
@@ -611,11 +651,11 @@ impl<J: Journal, B: Backend> Engine<J, B> {
                 .map(|(id, s)| (id.clone(), s.request.clone(), s.progress.clone()))
                 .collect(),
         };
-        let payload = serde_json::to_vec(&snapshot).map_err(|e| Error::Invalid(e.to_string()))?;
+        let payload = serde_json::to_vec(&snapshot).map_err(Error::invalid_source)?;
         self.poisoned = true;
         self.journal
             .compact(self.sequence, 2, &payload, retention)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+            .map_err(|e| Error::journal(e, "compact"))?;
         self.poisoned = false;
         Ok(())
     }
@@ -637,7 +677,7 @@ impl<J: Journal, B: Backend> Engine<J, B> {
     }
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
-            Err(Error::InDoubt(
+            Err(Error::in_doubt(
                 "journal uncertainty; drop and reopen engine/backend".into(),
             ))
         } else {
@@ -646,18 +686,31 @@ impl<J: Journal, B: Backend> Engine<J, B> {
     }
     fn write(&mut self, record: &Record) -> Result<(), Error> {
         self.healthy()?;
-        let payload = serde_json::to_vec(record).map_err(|e| Error::Invalid(e.to_string()))?;
+        let payload = serde_json::to_vec(record).map_err(Error::invalid_source)?;
+        let context = match record {
+            Record::Header { .. } => pactum_errors::ErrorContext {
+                phase: Some("native_header".into()),
+                ..Default::default()
+            },
+            Record::Begin { id, .. } | Record::Progress { id, .. } => pactum_errors::ErrorContext {
+                transaction: Some(id.as_str().into()),
+                phase: Some("native_execution".into()),
+                ..Default::default()
+            },
+        };
         self.poisoned = true;
-        let sequence = self
-            .journal
-            .append(2, &payload)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
-        let durable = self
-            .journal
-            .flush()
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        let sequence = self.journal.append(2, &payload).map_err(|e| {
+            let error = Error::journal(e, "append").with_context(context.clone());
+            error.trace();
+            error
+        })?;
+        let durable = self.journal.flush().map_err(|e| {
+            let error = Error::journal(e, "flush").with_context(context.clone());
+            error.trace();
+            error
+        })?;
         if sequence != self.sequence + 1 || durable != sequence {
-            return Err(Error::InDoubt("invalid durability barrier".into()));
+            return Err(Error::in_doubt("invalid durability barrier".into()).with_context(context));
         }
         self.sequence = sequence;
         self.poisoned = false;
@@ -698,10 +751,22 @@ impl<J: Journal, B: Backend> Engine<J, B> {
             operation: id.clone(),
             progress: s.progress.clone(),
             last_error: s.last_error.clone(),
+            diagnostic: s.diagnostic.clone(),
         }
     }
     fn failure(&mut self, id: &OperationId, error: BackendError) -> OperationStatus {
-        self.states.get_mut(id).unwrap().last_error = Some(error.to_string());
+        let diagnostic = error
+            .diagnostic()
+            .clone()
+            .with_context(pactum_errors::ErrorContext {
+                transaction: Some(id.as_str().into()),
+                phase: Some("native_execution".into()),
+                ..Default::default()
+            });
+        diagnostic.trace();
+        let state = self.states.get_mut(id).unwrap();
+        state.last_error = Some(diagnostic.to_string());
+        state.diagnostic = Some(diagnostic);
         self.snapshot(id)
     }
     fn advance(
@@ -752,7 +817,7 @@ impl<J: Journal, B: Backend> Engine<J, B> {
                             self.progress(id, Progress::Chunked(s))?;
                             return Ok(self.failure(
                                 id,
-                                BackendError(
+                                BackendError::message(
                                     "chunk rejected; immutable operation remains partial".into(),
                                 ),
                             ));
@@ -816,13 +881,13 @@ impl<J: Journal, B: Backend> Execution for Engine<J, B> {
             Request::StagedPublish(r) => r.payload.len() > self.policy.max_unit_bytes,
         };
         if oversized {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "unit exceeds configured byte limit; split into smaller chunks".into(),
             ));
         }
         if let Some(state) = self.states.get(&id) {
             if state.request != request {
-                return Err(Error::Invalid(
+                return Err(Error::invalid(
                     "operation key reused for different payload/mode/precondition".into(),
                 ));
             }
@@ -905,7 +970,7 @@ impl<J: Journal, B: Backend> crate::recovery::RecoveryTarget for Engine<J, B> {
         self.healthy()?;
         let id = OperationId::new(key)?;
         if !self.states.contains_key(&id) {
-            return Err(Error::Invalid("unknown operation".into()));
+            return Err(Error::invalid("unknown operation".into()));
         }
         self.advance(&id, cancellation)
             .map(crate::recovery::Work::Operation)
@@ -1106,7 +1171,7 @@ mod tests {
             ],
             vec![progress(Progress::Atomic(AtomicStatus::Committed))],
         ] {
-            assert!(matches!(replay(history), Err(Error::Corrupt(_))));
+            assert!(matches!(replay(history), Err(Error::Corrupt { .. })));
         }
     }
     #[test]

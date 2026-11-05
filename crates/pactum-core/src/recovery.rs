@@ -49,6 +49,50 @@ impl Work {
     pub fn is_paused(&self) -> bool {
         matches!(self, Self::Operation(OperationStatus { progress: Progress::Chunked(s), .. }) if s.paused)
     }
+    /// Stable metadata from the existing protocol; never infer a decision from it.
+    pub fn failure_metadata(&self) -> Option<pactum_errors::FailureMetadata> {
+        let context = match self {
+            Self::Transaction(s) => s.retry_context(),
+            _ => crate::RetryContext {
+                authority_valid: true,
+                idempotent: true,
+                ..Default::default()
+            },
+        };
+        match self {
+            Self::Transaction(s) => s.diagnostic.as_ref().map(|d| d.metadata(context)),
+            Self::Operation(s) => s.diagnostic.as_ref().map(|d| d.metadata(context)),
+            Self::Plan(s) => s
+                .steps
+                .values()
+                .filter_map(|s| match &s.report {
+                    Some(crate::plan::Report::Operational(f)) => Some(f.clone()),
+                    _ => None,
+                })
+                .max_by_key(|f| {
+                    u8::from(matches!(
+                        f.disposition,
+                        crate::RetryDisposition::Permanent
+                            | crate::RetryDisposition::OperatorIntervention
+                    ))
+                }),
+            Self::Saga(s) if s.needs_intervention => Some(
+                crate::Diagnostic::message(
+                    crate::ErrorCode::OperatorRequired,
+                    "Saga requires explicit intervention".into(),
+                )
+                .metadata(context),
+            ),
+            Self::Saga(s) => s
+                .steps
+                .values()
+                .flat_map(|s| [&s.forward, &s.compensation])
+                .find_map(|s| match &s.report {
+                    Some(crate::saga::ActionResult::Operational(f)) => Some(f.clone()),
+                    _ => None,
+                }),
+        }
+    }
     /// Latest local resource failure, which may be lost on process restart.
     pub fn last_error(&self) -> Option<&str> {
         match self {
@@ -56,6 +100,7 @@ impl Work {
             Self::Saga(s) => s.last_error.as_deref(),
             Self::Plan(s) => s.steps.values().find_map(|s| match &s.report {
                 Some(crate::plan::Report::Uncertain(e)) => Some(e.as_str()),
+                Some(crate::plan::Report::Operational(f)) => Some(f.code.as_str()),
                 _ => None,
             }),
             Self::Operation(s) => s.last_error.as_deref(),
@@ -94,7 +139,7 @@ impl<J: Journal> RecoveryTarget for Coordinator<J> {
         self.healthy()?;
         let id = TransactionId::new(key)?;
         if !self.states.contains_key(&id) {
-            return Err(Error::Invalid("unknown transaction".into()));
+            return Err(Error::invalid("unknown transaction".into()));
         }
         self.recovery_passes += 1;
         self.reconcile(&id, cancellation)
@@ -161,6 +206,9 @@ pub struct Schedule {
     pub reason: Reason,
     /// Last error retained across restart.
     pub last_error: Option<String>,
+    /// Stable recovery guidance. Absent in journals written before epic #51.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<pactum_errors::FailureMetadata>,
 }
 impl Schedule {
     fn new(time: u64) -> Self {
@@ -171,6 +219,7 @@ impl Schedule {
             first_seen_ms: time,
             reason: Reason::Retry,
             last_error: None,
+            failure: None,
         }
     }
     fn runnable(&self) -> bool {
@@ -280,8 +329,8 @@ impl<T> Handle<T> {
         self.commands
             .send(Command::Query(tx))
             .await
-            .map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())?
+            .map_err(stopped)?;
+        rx.await.map_err(stopped)?
     }
     /// Persist operator intent before acknowledging it. Pause takes effect after
     /// any already dispatched attempt; it is not a transaction cancellation.
@@ -290,8 +339,8 @@ impl<T> Handle<T> {
         self.commands
             .send(Command::Control(key.into(), control, tx))
             .await
-            .map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())?
+            .map_err(stopped)?;
+        rx.await.map_err(stopped)?
     }
 }
 /// Optional runner, owning exactly one target and a separate single-owner journal.
@@ -325,38 +374,55 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
                 .checked_add(config.poll_interval)
                 .is_none()
         {
-            return Err(Error::Invalid("invalid recovery configuration".into()));
+            return Err(Error::invalid("invalid recovery configuration".into()));
         }
         if journal
             .checkpoint()
-            .map_err(|e| Error::Corrupt(e.to_string()))?
+            .map_err(|source| Error::journal_read(source, "checkpoint"))?
             .is_some()
         {
-            return Err(Error::Corrupt("schedule checkpoints unsupported".into()));
+            return Err(Error::corrupt("schedule checkpoints unsupported".into()));
         }
         let mut sequence = 0u64;
         let mut schedules = BTreeMap::new();
         journal
             .visit(&mut |entry| {
                 if entry.version != 20 || Some(entry.sequence) != sequence.checked_add(1) {
-                    return Err(pactum_journal::JournalError(
+                    return Err(pactum_journal::JournalError::corrupt(
                         "invalid recovery journal sequence/schema".into(),
                     ));
                 }
                 if sequence == 0 {
-                    let binding: String = serde_json::from_slice(&entry.payload)
-                        .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
+                    let binding: String = serde_json::from_slice(&entry.payload).map_err(|e| {
+                        pactum_journal::JournalError::classified(
+                            crate::ErrorCode::CorruptHistory,
+                            e,
+                        )
+                    })?;
                     if binding != namespace {
-                        return Err(pactum_journal::JournalError(
+                        return Err(pactum_journal::JournalError::corrupt(
                             "recovery namespace mismatch".into(),
                         ));
                     }
                 } else {
-                    let event: Trace = serde_json::from_slice(&entry.payload)
-                        .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
-                    TransactionId::new(&event.key)
-                        .map_err(|e| pactum_journal::JournalError(e.to_string()))?;
+                    let event: Trace = serde_json::from_slice(&entry.payload).map_err(|e| {
+                        pactum_journal::JournalError::classified(
+                            crate::ErrorCode::CorruptHistory,
+                            e,
+                        )
+                    })?;
+                    TransactionId::new(&event.key).map_err(|e| {
+                        pactum_journal::JournalError::classified(
+                            crate::ErrorCode::CorruptHistory,
+                            e,
+                        )
+                    })?;
                     if let Some(schedule) = event.schedule {
+                        if schedule.failure.as_ref().is_some_and(|f| !f.is_valid()) {
+                            return Err(pactum_journal::JournalError::corrupt(
+                                "invalid recovery failure metadata".into(),
+                            ));
+                        }
                         schedules.insert(event.key, schedule);
                     } else {
                         schedules.remove(&event.key);
@@ -365,7 +431,7 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
                 sequence = entry.sequence;
                 Ok(())
             })
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+            .map_err(|source| Error::journal_read(source, "replay"))?;
         let rng = config.jitter_seed.max(1);
         let mut runner = Self {
             target: Arc::new(Mutex::new(target)),
@@ -380,9 +446,7 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
             observer: None,
         };
         if sequence == 0 {
-            runner.write(
-                &serde_json::to_vec(namespace).map_err(|e| Error::Invalid(e.to_string()))?,
-            )?;
+            runner.write(&serde_json::to_vec(namespace).map_err(Error::invalid_source)?)?;
         }
         Ok(runner)
     }
@@ -395,19 +459,19 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
     }
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.poisoned {
-            return Err(Error::InDoubt("reopen recovery schedule journal".into()));
+            return Err(Error::in_doubt("reopen recovery schedule journal".into()));
         }
         self.poisoned = true;
         let seq = self
             .journal
             .append(20, bytes)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+            .map_err(|e| Error::journal(e, "append"))?;
         let durable = self
             .journal
             .flush()
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+            .map_err(|e| Error::journal(e, "flush"))?;
         if Some(seq) != self.sequence.checked_add(1) || durable != seq {
-            return Err(Error::InDoubt("recovery barrier mismatch".into()));
+            return Err(Error::in_doubt("recovery barrier mismatch".into()));
         }
         self.sequence = seq;
         self.poisoned = false;
@@ -419,7 +483,14 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
             schedule,
             action: action.into(),
         };
-        self.write(&serde_json::to_vec(&event).map_err(|e| Error::Invalid(e.to_string()))?)?;
+        self.write(&serde_json::to_vec(&event).map_err(Error::invalid_source)?)
+            .map_err(|e| {
+                e.with_context(crate::ErrorContext {
+                    transaction: Some(key.into()),
+                    phase: Some("recovery_schedule".into()),
+                    ..Default::default()
+                })
+            })?;
         if let Some(observer) = &self.observer {
             observer(&event);
         }
@@ -505,7 +576,7 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
                 let fatal = result
                     .as_ref()
                     .err()
-                    .filter(|e| !matches!(e, Error::Invalid(_)))
+                    .filter(|e| !matches!(e, Error::Invalid { .. }))
                     .cloned();
                 let _ = reply.send(result);
                 if let Some(e) = fatal {
@@ -518,7 +589,7 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
     async fn apply_control(&mut self, key: &str, control: &Control) -> Result<(), Error> {
         let work = self.target.lock().await.pending_work()?;
         if !work.iter().any(|w| w.key() == key) {
-            return Err(Error::Invalid("key is not pending".into()));
+            return Err(Error::invalid("key is not pending".into()));
         }
         let mut schedule = self
             .schedules
@@ -598,14 +669,50 @@ impl<T: RecoveryTarget + 'static, S: Journal + 'static> Runner<T, S> {
                         schedule.reason = Reason::ProtocolPaused;
                     }
                     schedule.last_error = work.last_error().map(str::to_owned);
+                    schedule.failure = work.failure_metadata();
+                    if let Some(failure) = &schedule.failure {
+                        if matches!(
+                            failure.disposition,
+                            crate::RetryDisposition::Permanent
+                                | crate::RetryDisposition::OperatorIntervention
+                        ) {
+                            schedule.reason = Reason::Permanent(failure.code.as_str().into());
+                        }
+                        if failure.code == crate::ErrorCode::StaleOwner {
+                            return Err(Error::operational(failure.diagnostic()));
+                        }
+                    }
                     self.save(&key, Some(schedule), "unresolved")?;
                 }
-                Err(Error::Invalid(reason)) => {
-                    schedule.reason = Reason::Permanent(reason.clone());
-                    schedule.last_error = Some(reason);
-                    self.save(&key, Some(schedule), "permanent")?;
+                Err(e) => {
+                    let context = crate::RetryContext {
+                        authority_valid: true,
+                        idempotent: true,
+                        journal_write: matches!(e, Error::InDoubt { .. }),
+                        ..Default::default()
+                    };
+                    let failure = e.metadata(context);
+                    e.trace();
+                    match failure.disposition {
+                        crate::RetryDisposition::ReconcileBeforeRetry => return Err(e),
+                        crate::RetryDisposition::OperatorIntervention
+                            if matches!(
+                                e.code(),
+                                crate::ErrorCode::StaleOwner | crate::ErrorCode::CorruptHistory
+                            ) =>
+                        {
+                            return Err(e);
+                        }
+                        crate::RetryDisposition::Permanent
+                        | crate::RetryDisposition::OperatorIntervention => {
+                            schedule.reason = Reason::Permanent(failure.code.as_str().into());
+                        }
+                        crate::RetryDisposition::Retry => schedule.reason = Reason::Transient,
+                    }
+                    schedule.last_error = Some(failure.code.as_str().into());
+                    schedule.failure = Some(failure);
+                    self.save(&key, Some(schedule), "classified_failure")?;
                 }
-                Err(e) => return Err(e),
             }
             tokio::task::yield_now().await;
         }
@@ -646,8 +753,16 @@ fn now() -> u64 {
         .as_millis()
         .min(u64::MAX as u128) as u64
 }
-fn stopped() -> Error {
-    Error::Invalid("recovery runner stopped; inspect join result".into())
+fn stopped(source: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Error::operational(crate::Diagnostic::caused(
+        crate::ErrorCode::OperatorRequired,
+        source,
+    ))
+    .with_context(crate::ErrorContext {
+        phase: Some("recovery_service".into()),
+        operation: Some("command_channel".into()),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -678,7 +793,7 @@ mod tests {
         }
         fn flush(&mut self) -> Result<u64, JournalError> {
             if self.fail.load(Ordering::SeqCst) {
-                return Err(JournalError("lost barrier acknowledgement".into()));
+                return Err(JournalError::message("lost barrier acknowledgement".into()));
             }
             Ok(self.records.lock().unwrap().len() as u64)
         }
@@ -706,6 +821,7 @@ mod tests {
                                 operation: OperationId::new(*key).unwrap(),
                                 progress: Progress::Atomic(AtomicStatus::Indeterminate),
                                 last_error: Some("resource offline".into()),
+                                diagnostic: None,
                             }),
                         )
                     })
@@ -732,7 +848,7 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             if self.invalid {
-                return Err(Error::Invalid("fix resource configuration".into()));
+                return Err(Error::invalid("fix resource configuration".into()));
             }
             Ok(self.work[key].clone())
         }
@@ -746,6 +862,44 @@ mod tests {
             jitter_seed: 1,
             command_capacity: 1,
         }
+    }
+    #[tokio::test]
+    async fn classified_metadata_survives_restart_and_blocks_automatic_dispatch() {
+        let mut target = Target::new(&["a"]);
+        let Work::Operation(status) = target.work.get_mut("a").unwrap() else {
+            unreachable!()
+        };
+        status.diagnostic = Some(crate::Diagnostic::caused(
+            crate::ErrorCode::InvalidInput,
+            std::io::Error::other("password=SECRET"),
+        ));
+        let memory = Memory::default();
+        let mut runner = Runner::open(target.clone(), memory.clone(), "owner", config()).unwrap();
+        runner.tick(&Cancellation::default()).await.unwrap();
+        let failure = runner.schedules["a"].failure.as_ref().unwrap();
+        assert_eq!(failure.code, crate::ErrorCode::InvalidInput);
+        assert_eq!(failure.disposition, crate::RetryDisposition::Permanent);
+        assert!(matches!(runner.schedules["a"].reason, Reason::Permanent(_)));
+        let schedule = runner.schedules["a"].clone();
+        assert!(!serde_json::to_string(&schedule).unwrap().contains("SECRET"));
+        drop(runner);
+        let mut reopened = Runner::open(target, memory, "owner", config()).unwrap();
+        assert_eq!(reopened.schedules["a"], schedule);
+        reopened.tick(&Cancellation::default()).await.unwrap();
+        assert_eq!(reopened.metrics.attempts, 0);
+        reopened.apply_control("a", &Control::Retry).await.unwrap();
+        reopened.tick(&Cancellation::default()).await.unwrap();
+        assert_eq!(reopened.metrics.attempts, 1);
+    }
+    #[test]
+    fn schedules_written_before_typed_errors_remain_readable() {
+        let schedule: Schedule = serde_json::from_value(serde_json::json!({
+            "attempts": 2, "last_attempt_ms": 100, "next_attempt_ms": 200,
+            "first_seen_ms": 1, "reason": "Transient", "last_error": "legacy diagnostic"
+        }))
+        .unwrap();
+        assert!(schedule.failure.is_none());
+        assert!(schedule.runnable());
     }
     #[tokio::test]
     async fn fairness_backoff_and_durable_attempts() {
@@ -830,12 +984,12 @@ mod tests {
         memory.fail.store(true, Ordering::SeqCst);
         assert!(matches!(
             runner.tick(&Cancellation::default()).await,
-            Err(Error::InDoubt(_))
+            Err(Error::InDoubt { .. })
         ));
         assert!(calls.lock().unwrap().is_empty());
         assert!(matches!(
             runner.tick(&Cancellation::default()).await,
-            Err(Error::InDoubt(_))
+            Err(Error::InDoubt { .. })
         ));
         drop(runner);
         memory.fail.store(false, Ordering::SeqCst);
@@ -952,7 +1106,7 @@ mod tests {
         ] {
             assert!(matches!(
                 Runner::open(Target::new(&[]), Memory::default(), "owner", cfg),
-                Err(Error::Invalid(_))
+                Err(Error::Invalid { .. })
             ));
         }
     }

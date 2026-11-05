@@ -3,7 +3,8 @@
 Pactum v0.2 is an independent Rust transaction engine with Atomic, Chunked,
 StagedPublish, durable two-phase commit (2PC), and optional Saga execution.
 It provides typed mode-specific outcomes, stable idempotency keys and deterministic restart recovery.
-The existing v0.1 coordinator and participant API remains supported.
+The coordinator and participant protocols remain supported; source migrations for
+structured errors are documented in the [error-handling guide](docs/error-handling.md).
 
 In 2PC, a commit or abort decision crosses a durable journal barrier before any resource
 receives finalization. Successful completion requires durable acknowledgements
@@ -14,6 +15,7 @@ is reported explicitly; recovery never reverses a recorded decision.
 
 | Crate | Responsibility |
 | --- | --- |
+| `pactum-errors` | Stable error codes, SNAFU source chains, safe context and recovery classification |
 | `pactum-core` | Stable IDs, multi-mode execution, 2PC, durable transaction DAGs, Sagas, recovery and cancellation |
 | `pactum-journal` | Independent ordered byte journal and explicit durability barrier |
 | `pactum-sqlite` | SQLite WAL/FULL journal plus transactional receipt and publish reference backend |
@@ -21,10 +23,17 @@ is reported explicitly; recovery never reverses a recorded decision.
 | `pactum-distributed` | Opt-in fenced 2PC ownership, durable reference authority and remote participant protocol |
 | `pactum-demo` | Durable 2PC counters, mode and Saga examples, and crash tests |
 
-Core depends on the journal contract, not SQLite or the demo. Journal has no
-external dependencies and can be used without the engine. There are no Aquanet
-or ContentGraph dependencies. Application adapters belong to their consumers.
+Core depends on the journal contract and shared error vocabulary, not SQLite or
+the demo. Journal can be used without the engine and has no database or async
+runtime dependency. There are no Aquanet or ContentGraph dependencies. Application adapters belong to their consumers.
 A facade crate is deferred until it adds value.
+
+## Structured errors
+
+The [error-handling guide](docs/error-handling.md) documents stable codes,
+phase-aware retry and decision guidance, source-preserving diagnostics, safe
+tracing, operator controls and the remote protocol v2 migration. A failed call
+never replaces the authoritative protocol outcome or reverses a durable decision.
 
 ## Multi-mode execution
 

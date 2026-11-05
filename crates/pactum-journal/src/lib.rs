@@ -2,7 +2,7 @@
 //!
 //! Implementations preserve every flushed prefix and reject corruption. Any
 //! append/flush error is ambiguous: drop and reopen before further decisions.
-use std::{error::Error, fmt};
+pub use pactum_errors::{Diagnostic, ErrorCode, ErrorContext};
 
 /// Journal position, starting at one.
 pub type Sequence = u64;
@@ -19,14 +19,58 @@ pub struct Entry {
 }
 
 /// Storage failure, including uncertain durability and corrupt replay.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JournalError(pub String);
-impl fmt::Display for JournalError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct JournalError {
+    source: pactum_errors::Diagnostic,
+}
+impl JournalError {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::DurabilityUnknown,
+            detail,
+        ))
+    }
+    /// Report a validated durable schema/history invariant failure.
+    pub fn corrupt(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::CorruptHistory,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::DurabilityUnknown, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
     }
 }
-impl Error for JournalError {}
+impl std::ops::Deref for JournalError {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
 
 /// Validated checkpoint envelope. The backend authenticates all fields with a checksum.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +136,7 @@ pub trait Journal: Send {
         _payload: &[u8],
         _retention: Retention,
     ) -> Result<(), JournalError> {
-        Err(JournalError(
+        Err(JournalError::message(
             "checkpoint installation is unsupported".into(),
         ))
     }

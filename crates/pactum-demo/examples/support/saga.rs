@@ -76,8 +76,12 @@ impl SagaAdapter for ExternalStub {
                 .or_else(|| s.strip_prefix("retry:"))
                 .is_some_and(|n| n.parse::<i64>().is_ok())
     }
-    async fn execute(&self, key: OperationId, payload: Vec<u8>) -> Result<ActionResult, String> {
-        let run = || -> Result<ActionResult, Box<dyn std::error::Error>> {
+    async fn execute(
+        &self,
+        key: OperationId,
+        payload: Vec<u8>,
+    ) -> Result<ActionResult, pactum_core::saga::SagaError> {
+        let run = || -> Result<ActionResult, pactum_sqlite::AdapterError> {
             let mut db = self.db.lock().unwrap();
             let tx = db.transaction()?;
             let old: Option<(Vec<u8>, String)> = tx
@@ -125,7 +129,7 @@ impl SagaAdapter for ExternalStub {
             tx.commit()?;
             Ok(result)
         };
-        run().map_err(|e| e.to_string())
+        run().map_err(|e| pactum_core::saga::SagaError::from_diagnostic(e.diagnostic()))
     }
 }
 pub fn aid() -> AdapterId {

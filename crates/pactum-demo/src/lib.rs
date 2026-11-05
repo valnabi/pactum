@@ -12,8 +12,8 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-fn error(e: impl std::fmt::Display) -> ParticipantError {
-    ParticipantError(e.to_string())
+fn error(e: impl Into<pactum_sqlite::AdapterError>) -> ParticipantError {
+    ParticipantError::from_diagnostic(e.into().diagnostic())
 }
 
 /// Durable additive counter with an identity permanently stored in its database.
@@ -59,11 +59,13 @@ impl DurableCounter {
     ) -> Result<T, ParticipantError> {
         let connection = self.connection.clone();
         tokio::task::spawn_blocking(move || {
-            let mut connection = connection.lock().map_err(error)?;
+            let mut connection = connection
+                .lock()
+                .map_err(|_| error("resource mutex poisoned"))?;
             operation(&mut connection)
         })
         .await
-        .map_err(error)?
+        .map_err(ParticipantError::from_source)?
     }
     /// Read this resource's local committed value.
     pub async fn value(&self) -> Result<i64, ParticipantError> {

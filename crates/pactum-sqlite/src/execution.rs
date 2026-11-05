@@ -7,8 +7,14 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
 
-fn error(e: impl std::fmt::Display) -> BackendError {
-    BackendError(e.to_string())
+fn error(e: impl Into<crate::AdapterError>) -> BackendError {
+    BackendError::from_diagnostic(e.into().diagnostic())
+}
+fn corrupt(detail: &str) -> BackendError {
+    BackendError::from_diagnostic(pactum_errors::Diagnostic::message(
+        pactum_errors::ErrorCode::CorruptHistory,
+        detail.into(),
+    ))
 }
 /// A counter delta for native units; a snapshot value for staged artifacts.
 /// Encode a vector of these as JSON for the reference backend.
@@ -127,7 +133,7 @@ impl SqliteBackend {
             Ok(VisibleVersion {
                 generation,
                 version: OperationId::new(version).map_err(error)?,
-                values: decode(&payload).ok_or_else(|| error("invalid published artifact"))?,
+                values: decode(&payload).ok_or_else(|| corrupt("invalid published artifact"))?,
             })
         })
         .transpose()
@@ -178,7 +184,7 @@ impl Backend for SqliteBackend {
             return match receipt.as_str() {
                 "committed" => Ok(UnitResult::Committed),
                 "aborted" => Ok(UnitResult::RolledBack),
-                _ => Err(error("invalid unit receipt")),
+                _ => Err(corrupt("invalid unit receipt")),
             };
         }
         let mut accepted = false;
@@ -255,7 +261,7 @@ impl Backend for SqliteBackend {
             )
             .map_err(error)?;
         if payload != request.payload {
-            return Err(error("staged artifact changed"));
+            return Err(corrupt("staged artifact changed"));
         }
         Ok(decode(&payload).is_some())
     }
@@ -281,7 +287,7 @@ impl Backend for SqliteBackend {
             )
             .map_err(error)?;
         if payload != request.payload || decode(&payload).is_none() {
-            return Err(error("invalid staged artifact"));
+            return Err(corrupt("invalid staged artifact"));
         }
         let generation: u64 = tx
             .query_row(

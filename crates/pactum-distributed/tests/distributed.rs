@@ -296,7 +296,7 @@ impl FencedResource for Intercept {
             }
             let result = self.inner.call(grant, tx, op).await;
             if self.commit_reply_loss.load(Ordering::SeqCst) {
-                return Err(ParticipantError("reply lost after effect".into()));
+                return Err(ParticipantError::message("reply lost after effect".into()));
             }
             return result;
         }
@@ -326,7 +326,10 @@ async fn takeover_fences_old_owner_waiting_on_prepare_and_preserves_abort() {
     assert_eq!(result[0].decision, Some(Decision::Abort));
     assert_eq!(result[0].outcome, Outcome::Aborted);
     gate.resume.notify_one();
-    assert!(matches!(executing.await.unwrap(), Err(Error::InDoubt(_))));
+    assert!(matches!(
+        executing.await.unwrap(),
+        Err(Error::InDoubt { .. })
+    ));
     assert_eq!(counter.value().unwrap(), 0);
     assert_eq!(
         takeover.status(&tid()).unwrap().unwrap().decision,
@@ -775,4 +778,101 @@ fn journal_truncation_checksum_and_future_schema_fail_closed() {
         let grant = reopened.acquire("new", ttl()).unwrap();
         assert!(reopened.open_journal(&grant).is_err());
     }
+}
+
+#[tokio::test]
+async fn remote_codes_and_correlation_survive_partitions_lost_replies_and_stale_epochs() {
+    use pactum_core::{ErrorCode, RetryContext, RetryDisposition};
+    let dir = tempfile::tempdir().unwrap();
+    let clock = TestClock::new();
+    let db = store(&dir.path().join("typed-errors.db"), clock.clone());
+    let counter = db.counter(pid()).unwrap();
+    let grant = db.acquire("owner", ttl()).unwrap();
+    let link = Arc::new(Loopback::new(counter.clone()));
+    let remote = RemoteResource::new(pid(), counter.domain(), link.clone(), ttl()).unwrap();
+    link.set_partitioned(true);
+    let error = remote
+        .call(&grant, &tid(), Operation::Prepare(b"7".to_vec()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Unavailable);
+    assert_eq!(error.context().transaction.as_deref(), Some(tid().as_str()));
+    assert_eq!(error.context().phase.as_deref(), Some("prepare"));
+    assert_eq!(error.context().request.as_ref().unwrap().len(), 64);
+    assert_eq!(error.context().epoch, Some(grant.epoch));
+    link.set_partitioned(false);
+    link.lose_replies(1);
+    let error = remote
+        .call(&grant, &tid(), Operation::Prepare(b"7".to_vec()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::TransportUnknown);
+    assert_eq!(
+        error.retry_disposition(RetryContext {
+            authority_valid: true,
+            idempotent: true,
+            ..Default::default()
+        }),
+        RetryDisposition::ReconcileBeforeRetry
+    );
+    assert!(matches!(
+        remote
+            .call(&grant, &tid(), Operation::Prepare(b"7".to_vec()))
+            .await
+            .unwrap(),
+        Reply::Prepared(_)
+    ));
+    clock.advance();
+    let next = db.acquire("new-owner", ttl()).unwrap();
+    let error = remote
+        .call(&grant, &tid(), Operation::Status)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::StaleOwner);
+    assert_eq!(error.context().epoch, Some(grant.epoch));
+    assert_eq!(error.context().request.as_ref().unwrap().len(), 64);
+    assert_eq!(
+        error.retry_disposition(RetryContext {
+            authority_valid: true,
+            idempotent: true,
+            ..Default::default()
+        }),
+        RetryDisposition::OperatorIntervention
+    );
+    assert!(matches!(
+        remote.call(&next, &tid(), Operation::Status).await.unwrap(),
+        Reply::Prepared(_)
+    ));
+}
+#[tokio::test]
+async fn typed_remote_timeout_retains_request_identity_and_version_one_fails_closed() {
+    use pactum_core::ErrorCode;
+    let dir = tempfile::tempdir().unwrap();
+    let db = store(&dir.path().join("timeout-errors.db"), TestClock::new());
+    let counter = db.counter(pid()).unwrap();
+    let grant = db.acquire("owner", ttl()).unwrap();
+    let remote = RemoteResource::new(
+        pid(),
+        counter.domain(),
+        Arc::new(SlowReply(Arc::new(Loopback::new(counter.clone())))),
+        Duration::from_millis(10),
+    )
+    .unwrap();
+    let error = remote
+        .call(&grant, &tid(), Operation::Prepare(b"7".to_vec()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::Timeout);
+    assert_eq!(error.context().request.as_ref().unwrap().len(), 64);
+    assert!(matches!(
+        counter
+            .call(&grant, &tid(), Operation::Status)
+            .await
+            .unwrap(),
+        Reply::Prepared(_)
+    ));
+    let mut request = Request::new(grant, pid(), tid(), Operation::Status, u64::MAX).unwrap();
+    request.version = 1;
+    let error = Endpoint::new(counter).handle(request).await.unwrap_err();
+    assert_eq!(error.code(), ErrorCode::ProtocolMismatch);
 }

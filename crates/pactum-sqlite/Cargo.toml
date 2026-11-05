@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+snafu.workspace = true
+pactum-errors.workspace = true
 pactum-core.workspace = true
 pactum-messaging.workspace = true
 serde.workspace = true

@@ -85,11 +85,11 @@ impl Saga {
             || self.steps.is_empty()
             || self.steps.len() > 1024
             || serde_json::to_vec(self)
-                .map_err(|e| Error::Invalid(e.to_string()))?
+                .map_err(Error::invalid_source)?
                 .len()
                 > 16 * 1024 * 1024
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "unsupported, empty or oversized Saga".into(),
             ));
         }
@@ -99,7 +99,7 @@ impl Saga {
                 .iter()
                 .any(|s| s.compensation == Compensation::Irreversible)
         {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "irreversible Saga step requires explicit Allow policy".into(),
             ));
         }
@@ -113,8 +113,7 @@ impl Saga {
     /// SHA-256 of the entire canonical immutable spec.
     pub fn fingerprint(&self) -> Result<String, Error> {
         Ok(crate::sha256_hex(
-            serde_json::to_vec(&self.clone().canonical()?)
-                .map_err(|e| Error::Invalid(e.to_string()))?,
+            serde_json::to_vec(&self.clone().canonical()?).map_err(Error::invalid_source)?,
         ))
     }
     fn operations(&self) -> impl Iterator<Item = &Operation> {
@@ -146,6 +145,65 @@ pub enum ActionResult {
     Retryable(String),
     /// Success is unknown; reconcile the SAME key before compensating anything.
     Uncertain(String),
+    /// Operational failure retaining uncertainty independently of its error class.
+    Operational(pactum_errors::FailureMetadata),
+}
+/// Saga adapter call failure. This never proves the operation was rejected.
+#[derive(Clone, Debug, PartialEq, Eq, snafu::Snafu)]
+#[snafu(transparent)]
+pub struct SagaError {
+    source: pactum_errors::Diagnostic,
+}
+impl SagaError {
+    /// Construct a safe legacy diagnostic; completion remains conservative.
+    pub fn message(detail: String) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::message(
+            pactum_errors::ErrorCode::AdapterUnknown,
+            detail,
+        ))
+    }
+    /// Preserve a typed boundary source using the conservative default code.
+    pub fn from_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::classified(pactum_errors::ErrorCode::AdapterUnknown, source)
+    }
+    /// Preserve a typed boundary source with an explicit machine-readable code.
+    pub fn classified(
+        code: pactum_errors::ErrorCode,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::from_diagnostic(pactum_errors::Diagnostic::caused(code, source))
+    }
+    /// Wrap an existing structured diagnostic without losing its classification.
+    pub fn from_diagnostic(source: pactum_errors::Diagnostic) -> Self {
+        Self { source }
+    }
+    /// Add allowlisted boundary identifiers, preserving prior metadata and sources.
+    pub fn with_context(self, context: pactum_errors::ErrorContext) -> Self {
+        Self {
+            source: self.source.with_context(context),
+        }
+    }
+    /// Inspect the structured diagnostic.
+    pub fn diagnostic(&self) -> &pactum_errors::Diagnostic {
+        &self.source
+    }
+}
+impl std::ops::Deref for SagaError {
+    type Target = pactum_errors::Diagnostic;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
+impl From<String> for SagaError {
+    fn from(detail: String) -> Self {
+        Self::message(detail)
+    }
+}
+impl From<&str> for SagaError {
+    fn from(detail: &str) -> Self {
+        Self::message(detail.into())
+    }
 }
 /// Cooperating external-like adapter. Persist effects and immutable key/payload
 /// receipts atomically, reject conflicting reuse, and retain receipts forever.
@@ -160,7 +218,7 @@ pub trait SagaAdapter: Send + Sync {
     fn accepts(&self, payload: &[u8]) -> bool;
     /// Execute or reconcile immutable work. Async calls must yield to Tokio.
     /// Transport errors are always uncertain, never definitive rejection.
-    async fn execute(&self, key: OperationId, payload: Vec<u8>) -> Result<ActionResult, String>;
+    async fn execute(&self, key: OperationId, payload: Vec<u8>) -> Result<ActionResult, SagaError>;
 }
 /// Bounded process-local dispatch policy; durable retry budgets live in the spec.
 #[derive(Clone, Debug)]
@@ -191,19 +249,27 @@ pub struct ActionStatus {
     pub budget_used: u32,
     /// Latest durable acknowledgement, if any.
     pub report: Option<ActionResult>,
+    /// Local typed cause; never serialized into authoritative records.
+    #[serde(skip)]
+    pub diagnostic: Option<pactum_errors::Diagnostic>,
 }
 impl ActionStatus {
     fn applied(&self) -> bool {
         self.report == Some(ActionResult::Applied)
     }
     fn uncertain(&self) -> bool {
-        self.attempts > 0 && matches!(self.report, None | Some(ActionResult::Uncertain(_)))
+        self.attempts > 0
+            && matches!(
+                self.report,
+                None | Some(ActionResult::Uncertain(_) | ActionResult::Operational(_))
+            )
     }
     fn error(&self) -> Option<&str> {
         match &self.report {
             Some(
                 ActionResult::Rejected(s) | ActionResult::Retryable(s) | ActionResult::Uncertain(s),
             ) => Some(s),
+            Some(ActionResult::Operational(failure)) => Some(failure.code.as_str()),
             _ => None,
         }
     }
@@ -320,6 +386,14 @@ impl State {
             if action.applied() {
                 continue;
             }
+            if action.budget_used > 0
+                && matches!(&action.report, Some(ActionResult::Operational(f)) if matches!(f.disposition, crate::RetryDisposition::Permanent | crate::RetryDisposition::OperatorIntervention))
+            {
+                return Next::Blocked(
+                    SagaOutcome::Uncertain,
+                    "operational failure requires reconciliation or operator action".into(),
+                );
+            }
             let exhausted = action.budget_used >= self.spec.retry_limit;
             if matches!(action.report, Some(ActionResult::Rejected(_)))
                 || (exhausted && matches!(action.report, Some(ActionResult::Retryable(_))))
@@ -401,6 +475,19 @@ enum Record {
         reason: String,
     },
 }
+fn saga_failure(
+    diagnostic: crate::Diagnostic,
+    context: crate::ErrorContext,
+) -> (ActionResult, Option<crate::Diagnostic>) {
+    let diagnostic = diagnostic.with_context(context);
+    diagnostic.trace();
+    let metadata = diagnostic.metadata(crate::RetryContext {
+        authority_valid: true,
+        idempotent: true,
+        ..Default::default()
+    });
+    (ActionResult::Operational(metadata), Some(diagnostic))
+}
 /// Single-owner Saga engine with dedicated format-5 journal. Uses the plan DAG
 /// validator and existing recovery service, without changing the 2PC coordinator.
 /// All journal write failures poison the engine; drop/reopen before recovery.
@@ -423,20 +510,20 @@ impl<J: Journal> SagaEngine<J> {
         policy: SagaPolicy,
     ) -> Result<Self, Error> {
         if policy.max_dispatches == 0 || policy.timeout.is_zero() {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "positive Saga dispatch bound and timeout required".into(),
             ));
         }
         if journal
             .checkpoint()
-            .map_err(|e| Error::Corrupt(e.to_string()))?
+            .map_err(|source| Error::journal_read(source, "checkpoint"))?
             .is_some()
         {
-            return Err(Error::Corrupt("Saga checkpoints unsupported".into()));
+            return Err(Error::corrupt("Saga checkpoints unsupported".into()));
         }
         let history = journal
             .replay()
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
+            .map_err(|source| Error::journal_read(source, "replay"))?;
         let mut engine = Self {
             journal,
             namespace,
@@ -448,16 +535,16 @@ impl<J: Journal> SagaEngine<J> {
         };
         for entry in history {
             if entry.version != 5 || engine.sequence.checked_add(1) != Some(entry.sequence) {
-                return Err(Error::Corrupt(
+                return Err(Error::corrupt(
                     "invalid Saga record version/sequence".into(),
                 ));
             }
-            let r: Record = serde_json::from_slice(&entry.payload)
-                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            let r: Record =
+                serde_json::from_slice(&entry.payload).map_err(Error::corrupt_source)?;
             if engine.sequence == 0 {
                 if !matches!(r, Record::Header { ref namespace } if namespace == &engine.namespace)
                 {
-                    return Err(Error::Corrupt("foreign Saga namespace/header".into()));
+                    return Err(Error::corrupt("foreign Saga namespace/header".into()));
                 }
             } else {
                 engine.apply(&r)?;
@@ -473,7 +560,7 @@ impl<J: Journal> SagaEngine<J> {
     }
     fn healthy(&self) -> Result<(), Error> {
         if self.poisoned {
-            Err(Error::InDoubt(
+            Err(Error::in_doubt(
                 "drop and reopen Saga engine after journal uncertainty".into(),
             ))
         } else {
@@ -481,7 +568,7 @@ impl<J: Journal> SagaEngine<J> {
         }
     }
     fn apply(&mut self, record: &Record) -> Result<(), Error> {
-        let corrupt = || Error::Corrupt("illegal Saga journal transition".into());
+        let corrupt = || Error::corrupt("illegal Saga journal transition".into());
         match record {
             Record::Header { .. } => return Err(corrupt()),
             Record::Begin { spec, bindings } => {
@@ -533,6 +620,7 @@ impl<J: Journal> SagaEngine<J> {
                 action.attempts = *attempt;
                 action.budget_used += 1;
                 action.report = None;
+                action.diagnostic = None;
             }
             Record::Report {
                 saga,
@@ -556,6 +644,9 @@ impl<J: Journal> SagaEngine<J> {
                     || action.attempts != *attempt
                     || action.report.is_some()
                 {
+                    return Err(corrupt());
+                }
+                if matches!(result, ActionResult::Operational(f) if !f.is_valid()) {
                     return Err(corrupt());
                 }
                 state.action_mut(step, *direction).report = Some(result.clone());
@@ -586,18 +677,66 @@ impl<J: Journal> SagaEngine<J> {
     }
     fn write(&mut self, record: &Record) -> Result<(), Error> {
         self.healthy()?;
-        let bytes = serde_json::to_vec(record).map_err(|e| Error::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(record).map_err(Error::invalid_source)?;
+        let context = match record {
+            Record::Header { namespace } => crate::ErrorContext {
+                transaction: Some(namespace.as_str().into()),
+                phase: Some("saga_header".into()),
+                ..Default::default()
+            },
+            Record::Begin { spec, .. } => crate::ErrorContext {
+                transaction: Some(spec.id.as_str().into()),
+                phase: Some("saga_begin".into()),
+                ..Default::default()
+            },
+            Record::Compensate { saga } => crate::ErrorContext {
+                transaction: Some(saga.as_str().into()),
+                phase: Some("compensation".into()),
+                ..Default::default()
+            },
+            Record::Attempt {
+                saga,
+                step,
+                direction,
+                ..
+            }
+            | Record::Report {
+                saga,
+                step,
+                direction,
+                ..
+            }
+            | Record::Retry {
+                saga,
+                step,
+                direction,
+                ..
+            } => crate::ErrorContext {
+                transaction: Some(saga.as_str().into()),
+                step: Some(step.as_str().into()),
+                phase: Some(
+                    match direction {
+                        Direction::Forward => "forward",
+                        Direction::Compensation => "compensation",
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        };
         self.poisoned = true;
-        let sequence = self
-            .journal
-            .append(5, &bytes)
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
-        let durable = self
-            .journal
-            .flush()
-            .map_err(|e| Error::InDoubt(e.to_string()))?;
+        let sequence = self.journal.append(5, &bytes).map_err(|e| {
+            let error = Error::journal(e, "append").with_context(context.clone());
+            error.trace();
+            error
+        })?;
+        let durable = self.journal.flush().map_err(|e| {
+            let error = Error::journal(e, "flush").with_context(context.clone());
+            error.trace();
+            error
+        })?;
         if self.sequence.checked_add(1) != Some(sequence) || durable != sequence {
-            return Err(Error::InDoubt("Saga barrier did not cover record".into()));
+            return Err(Error::in_doubt("Saga barrier did not cover record".into()));
         }
         self.sequence = sequence;
         self.poisoned = false;
@@ -668,13 +807,13 @@ impl<J: Journal> SagaEngine<J> {
         let state = self
             .states
             .get(id)
-            .ok_or_else(|| Error::Invalid("unknown Saga".into()))?;
+            .ok_or_else(|| Error::invalid("unknown Saga".into()))?;
         if !state.steps.contains_key(step) {
-            return Err(Error::Invalid("unknown Saga step".into()));
+            return Err(Error::invalid("unknown Saga step".into()));
         }
         let bytes =
             serde_json::to_vec(&(&self.namespace, state.spec.fingerprint()?, step, direction))
-                .map_err(|e| Error::Invalid(e.to_string()))?;
+                .map_err(Error::invalid_source)?;
         OperationId::new(format!("saga-v1-{}", crate::sha256_hex(bytes)))
     }
     fn check_adapters(&self, spec: &Saga) -> Result<BTreeMap<AdapterId, String>, Error> {
@@ -685,11 +824,11 @@ impl<J: Journal> SagaEngine<J> {
                 .get(&op.adapter)
                 .filter(|a| a.accepts(&op.payload))
                 .ok_or_else(|| {
-                    Error::Invalid(format!("missing/incompatible Saga adapter {}", op.adapter))
+                    Error::invalid(format!("missing/incompatible Saga adapter {}", op.adapter))
                 })?;
             let identity = a.identity();
             if identity.is_empty() || identity.len() > 65536 {
-                return Err(Error::Invalid("invalid Saga adapter identity".into()));
+                return Err(Error::invalid("invalid Saga adapter identity".into()));
             }
             bindings.insert(op.adapter.clone(), identity);
         }
@@ -708,12 +847,12 @@ impl<J: Journal> SagaEngine<J> {
         if let Some(old) = self.states.get(&spec.id)
             && old.spec != spec
         {
-            return Err(Error::Invalid("Saga ID reused with changed work".into()));
+            return Err(Error::invalid("Saga ID reused with changed work".into()));
         }
         let bindings = self.check_adapters(&spec)?;
         if let Some(old) = self.states.get(&spec.id) {
             if old.bindings != bindings {
-                return Err(Error::Invalid(
+                return Err(Error::invalid(
                     "Saga adapter resource incarnation changed".into(),
                 ));
             }
@@ -744,7 +883,7 @@ impl<J: Journal> SagaEngine<J> {
             let attempt = action
                 .attempts
                 .checked_add(1)
-                .ok_or_else(|| Error::Invalid("Saga attempt overflow".into()))?;
+                .ok_or_else(|| Error::invalid("Saga attempt overflow".into()))?;
             if action.budget_used > 0 {
                 tokio::select! { biased; _ = cancellation.cancelled() => break, _ = tokio::time::sleep(self.policy.retry_backoff) => {} }
             }
@@ -758,25 +897,42 @@ impl<J: Journal> SagaEngine<J> {
                 attempt,
             })?;
             calls += 1;
-            let result = tokio::select! {
+            let context = crate::ErrorContext {
+                transaction: Some(spec.id.as_str().into()),
+                step: Some(step.as_str().into()),
+                phase: Some(
+                    match direction {
+                        Direction::Forward => "forward",
+                        Direction::Compensation => "compensation",
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            };
+            let (result, diagnostic) = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => ActionResult::Uncertain("cancelled during Saga adapter call".into()),
+                _ = cancellation.cancelled() => saga_failure(crate::Diagnostic::message(crate::ErrorCode::Cancelled, "cancelled in flight".into()), context),
                 result = tokio::time::timeout(self.policy.timeout, adapter.execute(key, op.payload)) => match result {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => ActionResult::Uncertain(e),
-                    Err(_) => ActionResult::Uncertain("Saga adapter timeout".into()),
+                    Ok(Ok(r)) => (r, None),
+                    Ok(Err(e)) => saga_failure(e.diagnostic().clone(), context),
+                    Err(e) => saga_failure(crate::Diagnostic::caused(crate::ErrorCode::Timeout, e), context),
                 }
             };
             self.persist(Record::Report {
                 saga: spec.id.clone(),
-                step,
+                step: step.clone(),
                 direction,
                 attempt,
                 result,
             })?;
+            self.states
+                .get_mut(&spec.id)
+                .unwrap()
+                .action_mut(&step, direction)
+                .diagnostic = diagnostic;
         }
         self.status(&spec.id)?
-            .ok_or_else(|| Error::Corrupt("Saga disappeared".into()))
+            .ok_or_else(|| Error::corrupt("Saga disappeared".into()))
     }
     /// Reconcile using the permanently retained specification and receipt keys.
     pub async fn resume(
@@ -788,7 +944,7 @@ impl<J: Journal> SagaEngine<J> {
         let spec = self
             .states
             .get(id)
-            .ok_or_else(|| Error::Invalid("unknown Saga".into()))?
+            .ok_or_else(|| Error::invalid("unknown Saga".into()))?
             .spec
             .clone();
         self.execute(spec, cancellation).await
@@ -820,7 +976,7 @@ impl<J: Journal> SagaEngine<J> {
                         Compensation::Irreversible
                     )
                 {
-                    return Err(Error::Invalid(
+                    return Err(Error::invalid(
                         "irreversible boundary needs external remediation; cannot retry it away"
                             .into(),
                     ));
@@ -829,12 +985,12 @@ impl<J: Journal> SagaEngine<J> {
                     state.action(&id, direction).report,
                     Some(ActionResult::Rejected(_))
                 ) {
-                    return Err(Error::Invalid("permanent rejection needs external remediation; retained tombstone cannot be retried away".into()));
+                    return Err(Error::invalid("permanent rejection needs external remediation; retained tombstone cannot be retried away".into()));
                 }
                 return Ok((id, direction));
             }
         }
-        Err(Error::Invalid("no failed Saga action to retry".into()))
+        Err(Error::invalid("no failed Saga action to retry".into()))
     }
     /// Explicit operator authorization for one additional bounded retry budget.
     /// Persist an audit reason after repairing the SAME adapter/receipt store.
@@ -844,13 +1000,13 @@ impl<J: Journal> SagaEngine<J> {
         let state = self
             .states
             .get(id)
-            .ok_or_else(|| Error::Invalid("unknown Saga".into()))?;
+            .ok_or_else(|| Error::invalid("unknown Saga".into()))?;
         if !matches!(state.next(), Next::Blocked(_, _)) {
-            return Err(Error::Invalid("Saga does not require intervention".into()));
+            return Err(Error::invalid("Saga does not require intervention".into()));
         }
         let reason = reason.into();
         if reason.is_empty() || reason.len() > 4096 {
-            return Err(Error::Invalid(
+            return Err(Error::invalid(
                 "retry requires an audit reason of 1..=4096 bytes".into(),
             ));
         }
@@ -910,10 +1066,15 @@ impl<J: Journal> crate::recovery::RecoveryTarget for SagaEngine<J> {
     ) -> Result<crate::recovery::Work, Error> {
         let s = self.resume(&SagaId::new(key)?, cancellation).await?;
         if s.needs_intervention {
-            return Err(Error::Invalid(
-                s.last_error
-                    .unwrap_or_else(|| "Saga needs intervention".into()),
-            ));
+            return Err(Error::operational(crate::Diagnostic::message(
+                crate::ErrorCode::OperatorRequired,
+                "Saga needs explicit intervention".into(),
+            ))
+            .with_context(crate::ErrorContext {
+                transaction: Some(key.into()),
+                phase: Some("saga_recovery".into()),
+                ..Default::default()
+            }));
         }
         Ok(crate::recovery::Work::Saga(s))
     }
@@ -921,7 +1082,7 @@ impl<J: Journal> crate::recovery::RecoveryTarget for SagaEngine<J> {
         let id = SagaId::new(key)?;
         let s = self
             .status(&id)?
-            .ok_or_else(|| Error::Invalid("unknown Saga".into()))?;
+            .ok_or_else(|| Error::invalid("unknown Saga".into()))?;
         if s.needs_intervention {
             self.retry(&id, "recovery-service operator Resume")?;
         }

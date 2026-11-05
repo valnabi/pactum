@@ -88,7 +88,7 @@ async fn durable_commit_abort_duplicates_identity_and_conflicting_input() {
         coordinator
             .execute(tx(), enlist(&*a, &*b, true), &cancel)
             .await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     assert_eq!(a.value().await.unwrap(), 10);
     assert_eq!(b.value().await.unwrap(), 10);
@@ -140,7 +140,7 @@ async fn durable_commit_abort_duplicates_identity_and_conflicting_input() {
         coordinator
             .execute(tx(), enlist(&*a, &*b, true), &cancel)
             .await,
-        Err(Error::Invalid(_))
+        Err(Error::Invalid { .. })
     ));
     assert_eq!(
         coordinator
@@ -170,7 +170,7 @@ impl FailJournal {
     fn tick(&mut self) -> Result<(), JournalError> {
         self.step += 1;
         if self.step == self.fail_at {
-            Err(JournalError("injected uncertain write".into()))
+            Err(JournalError::message("injected uncertain write".into()))
         } else {
             Ok(())
         }
@@ -213,13 +213,13 @@ async fn every_write_and_flush_error_requires_reopen_and_never_reverses_decision
                 coordinator
                     .execute(tx(), enlist(&*a, &*b, false), &cancel)
                     .await,
-                Err(Error::InDoubt(_))
+                Err(Error::InDoubt { .. })
             ),
             "fault {fail_at}"
         );
         assert!(matches!(
             coordinator.recover(&cancel).await,
-            Err(Error::InDoubt(_))
+            Err(Error::InDoubt { .. })
         ));
         drop(coordinator);
         let mut coordinator = Coordinator::open(
@@ -293,11 +293,11 @@ impl Participant for Controlled {
             std::future::pending::<()>().await;
         }
         if self.fail_commit.load(Ordering::SeqCst) {
-            return Err(ParticipantError("offline".into()));
+            return Err(ParticipantError::message("offline".into()));
         }
         self.resource.commit(t, p).await?;
         if self.lose_commit_response.swap(false, Ordering::SeqCst) {
-            return Err(ParticipantError("commit response lost".into()));
+            return Err(ParticipantError::message("commit response lost".into()));
         }
         Ok(())
     }
@@ -771,7 +771,7 @@ async fn seed_undecided(path: &Path) {
         coordinator
             .execute(tx(), enlist(&*a, &*b, false), &Cancellation::default())
             .await,
-        Err(Error::InDoubt(_))
+        Err(Error::InDoubt { .. })
     ));
     assert!(matches!(
         a.status(&tx()).await.unwrap(),
@@ -898,7 +898,9 @@ async fn uncertain_checkpoint_acknowledgement_requires_reopen_and_preserves_pend
             if self.after_commit {
                 self.inner.compact(w, v, p, r)?;
             }
-            Err(JournalError("lost checkpoint acknowledgement".into()))
+            Err(JournalError::message(
+                "lost checkpoint acknowledgement".into(),
+            ))
         }
     }
     for after_commit in [false, true] {
@@ -912,9 +914,12 @@ async fn uncertain_checkpoint_acknowledgement_requires_reopen_and_preserves_pend
         let before = coordinator.status(&tx()).unwrap();
         assert!(matches!(
             coordinator.compact(pactum_journal::Retention::Compact),
-            Err(Error::InDoubt(_))
+            Err(Error::InDoubt { .. })
         ));
-        assert!(matches!(coordinator.status(&tx()), Err(Error::InDoubt(_))));
+        assert!(matches!(
+            coordinator.status(&tx()),
+            Err(Error::InDoubt { .. })
+        ));
         drop(coordinator);
         let coordinator = Coordinator::open(
             SqliteJournal::open(temp.path().join("j.db")).unwrap(),

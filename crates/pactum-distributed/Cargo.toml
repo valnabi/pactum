@@ -8,6 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+pactum-sqlite.workspace = true
+pactum-errors.workspace = true
+snafu.workspace = true
 pactum-core.workspace = true
 pactum-journal.workspace = true
 async-trait.workspace = true
