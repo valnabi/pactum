@@ -8,7 +8,6 @@ use crate::{Cancellation, Coordinator, Decision, Enlistment, Error, Outcome, Tra
 use async_trait::async_trait;
 use pactum_journal::Journal;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -134,9 +133,8 @@ impl TransactionPlan {
     /// SHA-256 of canonical immutable spec, including revision and payloads.
     pub fn fingerprint(&self) -> Result<String, Error> {
         let spec = self.clone().canonical()?;
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&spec).map_err(|e| Error::Invalid(e.to_string()))?)
+        Ok(crate::sha256_hex(
+            serde_json::to_vec(&spec).map_err(|e| Error::Invalid(e.to_string()))?,
         ))
     }
     /// Namespace-independent receipt seed shared by every attempt of a step.
@@ -150,7 +148,7 @@ impl TransactionPlan {
     fn receipt_seed(fingerprint: &str, step: &StepId) -> Result<OperationId, Error> {
         let bytes =
             serde_json::to_vec(&(fingerprint, step)).map_err(|e| Error::Invalid(e.to_string()))?;
-        OperationId::new(format!("plan-v1-{:x}", Sha256::digest(bytes)))
+        OperationId::new(format!("plan-v1-{}", crate::sha256_hex(bytes)))
     }
 }
 
@@ -838,8 +836,8 @@ impl<J: Journal> PlanEngine<J> {
                 let adapter = self.adapters[&step.adapter].clone();
                 // Namespace avoids collisions when independent plan journals share a backend.
                 let key = OperationId::new(format!(
-                    "plan-v1-{:x}",
-                    Sha256::digest(
+                    "plan-v1-{}",
+                    crate::sha256_hex(
                         serde_json::to_vec(&(
                             self.namespace.as_str(),
                             TransactionPlan::receipt_seed(&fingerprint, &step.id)?.as_str()

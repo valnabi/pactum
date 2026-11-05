@@ -8,7 +8,6 @@ use crate::{
 use async_trait::async_trait;
 use pactum_journal::Journal;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -113,12 +112,9 @@ impl Saga {
     }
     /// SHA-256 of the entire canonical immutable spec.
     pub fn fingerprint(&self) -> Result<String, Error> {
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&self.clone().canonical()?)
-                    .map_err(|e| Error::Invalid(e.to_string()))?
-            )
+        Ok(crate::sha256_hex(
+            serde_json::to_vec(&self.clone().canonical()?)
+                .map_err(|e| Error::Invalid(e.to_string()))?,
         ))
     }
     fn operations(&self) -> impl Iterator<Item = &Operation> {
@@ -679,7 +675,7 @@ impl<J: Journal> SagaEngine<J> {
         let bytes =
             serde_json::to_vec(&(&self.namespace, state.spec.fingerprint()?, step, direction))
                 .map_err(|e| Error::Invalid(e.to_string()))?;
-        OperationId::new(format!("saga-v1-{:x}", Sha256::digest(bytes)))
+        OperationId::new(format!("saga-v1-{}", crate::sha256_hex(bytes)))
     }
     fn check_adapters(&self, spec: &Saga) -> Result<BTreeMap<AdapterId, String>, Error> {
         let mut bindings = BTreeMap::new();

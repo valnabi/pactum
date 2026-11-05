@@ -16,6 +16,24 @@ use std::{
 };
 use tokio::sync::watch;
 
+fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn sha256_hex_preserves_persisted_encoding() {
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
 macro_rules! identifier {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
