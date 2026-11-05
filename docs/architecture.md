@@ -125,7 +125,7 @@ later reject for overflow. Nonnegative additions commute; rejection of a negativ
 delta demonstrates abort. The two databases have independent durability domains.
 
 There is no generic resource isolation layer, global atomic read snapshot, network
-transport, distributed coordinator consensus, active-active failover, saga engine,
+transport, distributed coordinator consensus, active-active failover,
 Aquanet/ContentGraph runtime, or FoundationDB backend. Active history is streamed
 after a validated checkpoint; see [journal lifecycle](journal-lifecycle.md).
 Adapters can be added by consumers through `Participant`, and other storage through `Journal`.
@@ -143,3 +143,14 @@ See [mode guide](execution-modes.md) for API usage and guarantees, and
 [ADR 0003](adr/0003-multi-mode-execution.md) for transitions, cancellation,
 recovery, cleanup and compatibility decisions. The engine retains one-owner local
 coordination and does not add consensus or cross-store Atomic transactions.
+
+## Optional Sagas for non-2PC resources
+
+`pactum-core::saga` adds typed forward and compensation requests, permanent
+direction-specific receipt keys, durable action budgets and reverse dependency
+compensation. It reuses transaction-plan DAG validation and the existing recovery
+service, while keeping format-5 Saga history separate from mode/2PC journals.
+It does not change the coordinator's decision rules. Ambiguous effects must be
+reconciled before compensation; permanent compensation failure and irreversible
+boundaries require explicit manual remediation. Compensation is not atomic
+rollback and a completed Saga is not an ACID commit. See [Saga contracts](sagas.md).

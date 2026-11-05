@@ -151,6 +151,10 @@ limits apply within one runner; this is not a general workflow engine, arbitrary
 agent scheduler, saga framework, or replacement for application orchestration.
 Core remains independent of Aquanet, ContentGraph and SQLite.
 
+For non-2PC operations requiring explicit business compensation, the optional
+[Saga engine](sagas.md) shares the DAG validator and recovery interface. Ordinary
+transaction plans retain their existing per-step guarantees and failure behavior.
+
 ## Verification
 
 `crates/pactum-demo/tests/plan.rs` covers DAG validation, canonical identities,

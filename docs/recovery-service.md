@@ -1,6 +1,9 @@
 # Optional recovery service
 
-`pactum_core::recovery` wraps the existing Coordinator, multi-mode Engine and bounded PlanEngine.
+`pactum_core::recovery` wraps the existing Coordinator, multi-mode Engine, bounded PlanEngine
+and optional [SagaEngine](sagas.md). Saga manual failures remain discoverable;
+operator Resume can renew an exhausted action budget but cannot bypass permanent
+rejections or irreversible boundaries. Compensation never implies atomic rollback.
 It is optional: direct `execute`, `recover`, `recover_pending` and status APIs
 keep their existing behavior. It uses Tokio, already required by core, and has
 no Aquanet, ContentGraph, transport, worker or hosting dependency.

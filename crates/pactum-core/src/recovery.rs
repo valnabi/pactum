@@ -21,6 +21,8 @@ pub enum Work {
     Transaction(Status),
     /// Bounded transaction plan; each step retains its own guarantee.
     Plan(crate::plan::PlanStatus),
+    /// Non-2PC Saga; compensation never implies atomic rollback.
+    Saga(crate::saga::SagaStatus),
     /// Atomic, Chunked or StagedPublish operation.
     Operation(OperationStatus),
 }
@@ -30,6 +32,7 @@ impl Work {
         match self {
             Self::Transaction(s) => s.transaction.as_str(),
             Self::Plan(s) => s.id.as_str(),
+            Self::Saga(s) => s.id.as_str(),
             Self::Operation(s) => s.operation.as_str(),
         }
     }
@@ -38,6 +41,7 @@ impl Work {
         match self {
             Self::Transaction(s) => s.outcome != Outcome::InDoubt,
             Self::Plan(s) => s.is_terminal(),
+            Self::Saga(s) => s.is_terminal(),
             Self::Operation(s) => s.progress.is_terminal(),
         }
     }
@@ -49,6 +53,7 @@ impl Work {
     pub fn last_error(&self) -> Option<&str> {
         match self {
             Self::Transaction(s) => s.last_error.as_deref(),
+            Self::Saga(s) => s.last_error.as_deref(),
             Self::Plan(s) => s.steps.values().find_map(|s| match &s.report {
                 Some(crate::plan::Report::Uncertain(e)) => Some(e.as_str()),
                 _ => None,

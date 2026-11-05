@@ -5,6 +5,19 @@ and permission to spawn/terminate their own child processes. No network is used.
 The matrix is exhaustive over the listed deterministic boundary sites; it is not
 a hardware power-failure simulator or a distributed-system model checker.
 
+## Saga compensation (#22)
+
+`crates/pactum-demo/tests/saga.rs` injects lost acknowledgements and real process
+exits before/after every Saga append, flush and adapter call. Scenarios include
+forward completion, reverse compensation, permanent compensation failure and
+irreversible boundaries, plus crashes during operator retry authorization.
+Restart preserves keyed effects exactly once; ambiguity
+blocks compensation until reconciliation. Tests also cover durable retry budgets,
+operator recovery, cancellation, timeouts, panic, dropped futures, fan-in,
+immutable compensator bindings and corrupt histories. See [Saga invariants](sagas.md).
+
+## Two-phase commit
+
 | Boundary/fault | Verified behavior |
 | --- | --- |
 | Before/after each append and flush for Begin, both Prepared records, decision, both acknowledgements | 24 injected journal errors poison the live coordinator; reopening resolves the actual durable prefix |

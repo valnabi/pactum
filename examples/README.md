@@ -33,3 +33,14 @@ cargo run -p pactum-demo --example multi_mode -- ./all-modes-data
 
 See [execution modes](../docs/execution-modes.md) for expected values, lifecycle
 usage and backend contracts. The combined example runs all four protocols.
+
+## Saga compensation
+
+```sh
+cargo run -p pactum-demo --example saga -- ./saga-data
+```
+
+Runs successful work, compensation after rejection, permanent compensator failure
+and an irreversible boundary. The retained balance is `50` on repeated runs.
+See [Saga contracts and intervention](../docs/sagas.md); compensation is not
+atomic rollback. Crash-injected versions are exercised by `tests/saga.rs`.

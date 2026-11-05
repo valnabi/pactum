@@ -119,19 +119,7 @@ impl TransactionPlan {
                 }
             }
         }
-        let mut done = BTreeSet::new();
-        let mut order = Vec::new();
-        while done.len() < steps.len() {
-            let next = steps
-                .values()
-                .find(|s| !done.contains(&s.id) && s.dependencies.is_subset(&done));
-            let Some(s) = next else {
-                return Err(Error::Invalid("dependency cycle".into()));
-            };
-            done.insert(s.id.clone());
-            order.push(s.id.clone());
-        }
-        Ok(order)
+        dependency_order(self.steps.iter().map(|s| (&s.id, &s.dependencies)))
     }
     fn canonical(mut self) -> Result<Self, Error> {
         self.validate()?;
@@ -164,6 +152,37 @@ impl TransactionPlan {
             serde_json::to_vec(&(fingerprint, step)).map_err(|e| Error::Invalid(e.to_string()))?;
         OperationId::new(format!("plan-v1-{:x}", Sha256::digest(bytes)))
     }
+}
+
+// Shared deterministic DAG validation for plans and optional Saga execution.
+pub(crate) fn dependency_order<'a>(
+    steps: impl Iterator<Item = (&'a StepId, &'a BTreeSet<StepId>)>,
+) -> Result<Vec<StepId>, Error> {
+    let mut graph = BTreeMap::new();
+    for (id, dependencies) in steps {
+        if graph.insert(id, dependencies).is_some() {
+            return Err(Error::Invalid("duplicate step ID".into()));
+        }
+    }
+    if graph
+        .values()
+        .any(|deps| deps.iter().any(|d| !graph.contains_key(d)))
+    {
+        return Err(Error::Invalid("unknown dependency".into()));
+    }
+    let mut done = BTreeSet::new();
+    let mut order = Vec::new();
+    while done.len() < graph.len() {
+        let next = graph
+            .iter()
+            .find(|(id, deps)| !done.contains(**id) && deps.is_subset(&done));
+        let Some((id, _)) = next else {
+            return Err(Error::Invalid("dependency cycle".into()));
+        };
+        done.insert((*id).clone());
+        order.push((*id).clone());
+    }
+    Ok(order)
 }
 /// Durable mode-specific step result. Completed values are immutable outputs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

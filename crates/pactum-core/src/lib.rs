@@ -937,3 +937,6 @@ pub mod recovery;
 
 /// Durable bounded transaction plans and mode adapters.
 pub mod plan;
+
+/// Durable forward operations and explicit best-effort compensations.
+pub mod saga;

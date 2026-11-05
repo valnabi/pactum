@@ -1,8 +1,8 @@
 # Pactum
 
 Pactum v0.2 is an independent Rust transaction engine with Atomic, Chunked,
-StagedPublish and durable two-phase commit (2PC) execution. It provides typed
-mode-specific outcomes, stable idempotency keys and deterministic restart recovery.
+StagedPublish, durable two-phase commit (2PC), and optional Saga execution.
+It provides typed mode-specific outcomes, stable idempotency keys and deterministic restart recovery.
 The existing v0.1 coordinator and participant API remains supported.
 
 In 2PC, a commit or abort decision crosses a durable journal barrier before any resource
@@ -14,10 +14,10 @@ is reported explicitly; recovery never reverses a recorded decision.
 
 | Crate | Responsibility |
 | --- | --- |
-| `pactum-core` | Stable IDs, multi-mode execution, 2PC, durable transaction DAGs, recovery and cancellation |
+| `pactum-core` | Stable IDs, multi-mode execution, 2PC, durable transaction DAGs, Sagas, recovery and cancellation |
 | `pactum-journal` | Independent ordered byte journal and explicit durability barrier |
 | `pactum-sqlite` | SQLite WAL/FULL journal plus transactional receipt and publish reference backend |
-| `pactum-demo` | Durable 2PC counters, mode examples and crash tests |
+| `pactum-demo` | Durable 2PC counters, mode and Saga examples, and crash tests |
 
 Core depends on the journal contract, not SQLite or the demo. Journal has no
 external dependencies and can be used without the engine. There are no Aquanet
@@ -51,6 +51,21 @@ plans do not provide global atomicity or rollback previously completed effects.
 ```sh
 cargo run -p pactum-demo --example transaction_plan -- ./transaction-plan-data
 ```
+
+## Sagas for non-2PC resources
+
+The optional [Saga engine](docs/sagas.md) runs immutable forward operations and
+explicit compensations, with durable retry keys, reverse dependency ordering
+and restart recovery. Compensation is a business operation, not atomic rollback.
+Uncertain effects are reconciled before compensation; permanent failures and
+irreversible boundaries remain visible as manual intervention requirements.
+
+```sh
+cargo run -p pactum-demo --example saga -- ./saga-data
+```
+
+The example demonstrates completion, successful compensation, permanent
+compensator failure and an irreversible boundary with retained effects.
 
 ## Run the 2PC demonstration
 
@@ -108,7 +123,7 @@ retry bindings, decisions and pending state. SQLite streams the remaining tail;
 `recover_pending` uses a pending-work index. See the
 [journal lifecycle guide](docs/journal-lifecycle.md) for APIs, crash guarantees,
 retention limits and replay benchmarks. Mode/coordinator recovery visits keys in deterministic ID order. Plan steps use bounded concurrent DAG scheduling. There is
-no consensus, active-active failover, remote transport or saga engine.
+no consensus, active-active failover or remote transport.
 An optional [recovery service](docs/recovery-service.md) schedules subsequent
 recovery passes with durable backoff, operator controls and observability.
 See [architecture](docs/architecture.md) and [fault matrix](docs/fault-matrix.md).
