@@ -17,6 +17,7 @@ is reported explicitly; recovery never reverses a recorded decision.
 | `pactum-core` | Stable IDs, multi-mode execution, 2PC, durable transaction DAGs, Sagas, recovery and cancellation |
 | `pactum-journal` | Independent ordered byte journal and explicit durability barrier |
 | `pactum-sqlite` | SQLite WAL/FULL journal plus transactional receipt and publish reference backend |
+| `pactum-messaging` | Optional backend-neutral outbox/inbox contracts, dispatcher and fake transport |
 | `pactum-demo` | Durable 2PC counters, mode and Saga examples, and crash tests |
 
 Core depends on the journal contract, not SQLite or the demo. Journal has no
@@ -66,6 +67,17 @@ cargo run -p pactum-demo --example saga -- ./saga-data
 
 The example demonstrates completion, successful compensation, permanent
 compensator failure and an irreversible boundary with retained effects.
+
+## Reliable integration events
+
+The optional [outbox/inbox guide](docs/messaging.md) covers native transaction
+boundaries, leased at-least-once publication, bounded retry/dead letters,
+transactionally deduplicated handlers and per-key ordering. No broker is required
+for the reference producer/consumer demonstration:
+
+```sh
+cargo run -p pactum-demo --example messaging -- ./messaging-data
+```
 
 ## Run the 2PC demonstration
 

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 pactum-core.workspace = true
+pactum-messaging.workspace = true
 pactum-journal.workspace = true
 pactum-sqlite.workspace = true
 async-trait.workspace = true

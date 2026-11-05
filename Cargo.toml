@@ -13,6 +13,7 @@ publish = false
 pactum-journal = { path = "crates/pactum-journal" }
 pactum-core = { path = "crates/pactum-core" }
 pactum-sqlite = { path = "crates/pactum-sqlite" }
+pactum-messaging = { path = "crates/pactum-messaging" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

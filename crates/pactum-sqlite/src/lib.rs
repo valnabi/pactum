@@ -3,6 +3,8 @@
 //! Use local storage honoring SQLite locks and sync. Do not unlink lock files,
 //! use hard-link aliases, or access an open database through other writers.
 use fs2::FileExt;
+/// Optional native-transaction outbox/inbox reference adapter.
+pub mod messaging;
 use pactum_journal::{Checkpoint, Entry, Journal, JournalError, Retention, Sequence};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};

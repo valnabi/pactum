@@ -222,6 +222,7 @@ dependencies = [
  "async-trait",
  "pactum-core",
  "pactum-journal",
+ "pactum-messaging",
  "pactum-sqlite",
  "rusqlite",
  "serde_json",
@@ -234,12 +235,22 @@ name = "pactum-journal"
 version = "0.2.0"
 
 [[package]]
+name = "pactum-messaging"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "pactum-sqlite"
 version = "0.2.0"
 dependencies = [
  "fs2",
  "pactum-core",
  "pactum-journal",
+ "pactum-messaging",
  "rusqlite",
  "serde",
  "serde_json",
