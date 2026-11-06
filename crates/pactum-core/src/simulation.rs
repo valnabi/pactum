@@ -681,6 +681,30 @@ impl SimController {
         }
     }
 
+    /// Increment the simulated crash counter and record an explicit crash-and-reopen event.
+    pub fn record_crash_reopen(&self, target: &str) {
+        let time_ms = self.clock.current_millis();
+        let epoch = self.authority.as_ref().map(SimAuthority::current_epoch);
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.step += 1;
+            guard.crashes_triggered += 1;
+            let step = guard.step;
+            let seq = guard.durable_sequence;
+            guard.events.push(TraceEvent {
+                step,
+                time_ms,
+                component: SimComponent::Harness,
+                target: target.into(),
+                operation: "crash_and_reopen".into(),
+                phase: BoundaryPhase::BeforeEffect,
+                fault: Some(FaultAction::CrashProcess),
+                outcome: "crashed_and_reopened".into(),
+                durable_sequence: seq,
+                epoch,
+            });
+        }
+    }
+
     /// Enter a deterministic protocol boundary, increment the step counter, and evaluate
     /// any matching armed [`FaultRule`].
     pub fn enter_boundary(
@@ -906,6 +930,24 @@ impl SimJournalStore {
         }
         self.controller
             .record_harness(&self.namespace(), "crash_session", "unflushed_discarded");
+    }
+
+    /// Stage a speculative unflushed record and crash the session before flush,
+    /// discarding unflushed staging and incrementing the controller crash counter.
+    pub fn simulate_crash_and_reopen(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let seq = guard.head.saturating_add(1);
+            guard.active_staged.push(Entry {
+                sequence: seq,
+                version: 1,
+                payload: b"speculative-unflushed-record".to_vec(),
+            });
+            guard.discarded_staged_records += guard.active_staged.len();
+            guard.active_staged.clear();
+            guard.active_unfenced_owner = false;
+        }
+        self.controller.record_crash_reopen(&self.namespace());
+        self.controller.clear_crash();
     }
 
     /// Inject durable corruption so subsequent replay/checkpoint reads fail closed.
@@ -2921,6 +2963,23 @@ impl SimWorkload {
         Ok(())
     }
 
+    /// Return whether `component` participates in boundary fault rules for this workload.
+    pub const fn supports_component(&self, component: SimComponent) -> bool {
+        match self {
+            Self::TwoPhaseCommit { .. } | Self::FencedRecovery { .. } => {
+                matches!(component, SimComponent::Journal | SimComponent::Participant)
+            }
+            Self::NativeAtomic { .. }
+            | Self::NativeChunked { .. }
+            | Self::NativeStagedPublish { .. } => {
+                matches!(component, SimComponent::Journal | SimComponent::Backend)
+            }
+            Self::SagaExecution { .. } => {
+                matches!(component, SimComponent::Journal | SimComponent::SagaAdapter)
+            }
+        }
+    }
+
     /// Canonical set of workloads covering 2PC, native modes, Sagas, and fenced recovery.
     pub fn canonical_suite() -> Vec<Self> {
         vec![
@@ -3027,7 +3086,7 @@ pub enum ScheduleAction {
 }
 
 impl ScheduleAction {
-    /// Validate action parameters.
+    /// Validate action parameters independent of workload.
     pub fn validate(&self) -> Result<(), Error> {
         match self {
             Self::InjectFault { rule } => rule.validate(),
@@ -3041,6 +3100,50 @@ impl ScheduleAction {
             | Self::CrashAndReopen
             | Self::ExtraRecoveryPass
             | Self::CompactJournal { .. } => Ok(()),
+        }
+    }
+
+    /// Validate that this action is supported by `workload`.
+    pub fn validate_for(&self, workload: &SimWorkload) -> Result<(), Error> {
+        self.validate()?;
+        match self {
+            Self::InjectFault { rule } => {
+                if let Some(component) = rule.component
+                    && !workload.supports_component(component)
+                {
+                    return Err(invalid(
+                        "fault rule component is not supported by the target workload",
+                    ));
+                }
+                if matches!(rule.action, FaultAction::ExpireLease { .. })
+                    && !matches!(workload, SimWorkload::FencedRecovery { .. })
+                {
+                    return Err(invalid(
+                        "ExpireLease fault action is only supported on FencedRecovery workloads",
+                    ));
+                }
+                Ok(())
+            }
+            Self::ReorderParticipantMessages { .. } => {
+                if !matches!(
+                    workload,
+                    SimWorkload::TwoPhaseCommit { .. } | SimWorkload::FencedRecovery { .. }
+                ) {
+                    return Err(invalid(
+                        "ReorderParticipantMessages is only supported on 2PC and FencedRecovery workloads",
+                    ));
+                }
+                Ok(())
+            }
+            Self::CompactJournal { .. } => {
+                if matches!(workload, SimWorkload::SagaExecution { .. }) {
+                    return Err(invalid(
+                        "CompactJournal is not supported on SagaExecution workloads",
+                    ));
+                }
+                Ok(())
+            }
+            Self::AdvanceClock { .. } | Self::CrashAndReopen | Self::ExtraRecoveryPass => Ok(()),
         }
     }
 }
@@ -3065,7 +3168,7 @@ impl SimSchedule {
         }
         self.workload.validate()?;
         for action in &self.actions {
-            action.validate()?;
+            action.validate_for(&self.workload)?;
         }
         Ok(())
     }
@@ -3269,7 +3372,7 @@ impl StateExplorer {
         let action_count = 1 + rng.next_index(self.config.max_actions_per_schedule);
         let mut actions = Vec::with_capacity(action_count);
         for _ in 0..action_count {
-            let kind = rng.next_index(8);
+            let kind = rng.next_index(9);
             let step = 1 + rng.next_index(14);
             let action = match kind {
                 0 => ScheduleAction::InjectFault {
@@ -3334,15 +3437,28 @@ impl StateExplorer {
                         },
                     },
                 },
-                5 => ScheduleAction::ReorderParticipantMessages {
-                    seed: rng.next_u64(),
+                5 => ScheduleAction::AdvanceClock {
+                    millis: 50 + (rng.next_index(500) as u64),
                 },
-                6 => ScheduleAction::CrashAndReopen,
-                _ => ScheduleAction::CompactJournal {
-                    archive: rng.next_index(2) == 0,
+                6 => match &workload {
+                    SimWorkload::TwoPhaseCommit { .. } | SimWorkload::FencedRecovery { .. } => {
+                        ScheduleAction::ReorderParticipantMessages {
+                            seed: rng.next_u64(),
+                        }
+                    }
+                    _ => ScheduleAction::ExtraRecoveryPass,
+                },
+                7 => ScheduleAction::CrashAndReopen,
+                _ => match &workload {
+                    SimWorkload::SagaExecution { .. } => ScheduleAction::ExtraRecoveryPass,
+                    _ => ScheduleAction::CompactJournal {
+                        archive: rng.next_index(2) == 0,
+                    },
                 },
             };
-            actions.push(action);
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
         }
         SimSchedule {
             seed: schedule_seed,
@@ -3407,12 +3523,14 @@ impl StateExplorer {
                 }
             }
             for idx in 0..self.config.max_schedules {
-                candidates.push(
-                    self.generate_schedule(
-                        workload.clone(),
-                        w_idx * self.config.max_schedules + idx,
-                    ),
-                );
+                let generated = self
+                    .generate_schedule(workload.clone(), w_idx * self.config.max_schedules + idx);
+                if !candidates
+                    .iter()
+                    .any(|existing: &SimSchedule| existing.actions == generated.actions)
+                {
+                    candidates.push(generated);
+                }
             }
 
             for schedule in candidates {
@@ -3637,6 +3755,180 @@ impl StateExplorer {
         }
     }
 
+    async fn execute_interleaving_actions(
+        clock: &SimClock,
+        controller: &SimController,
+        journal_store: &SimJournalStore,
+        participant: Option<(&SimParticipantStore, &TransactionId, &[u8])>,
+        actions: &[ScheduleAction],
+    ) -> Result<(), Error> {
+        for action in actions {
+            match action {
+                ScheduleAction::AdvanceClock { millis } => {
+                    let now = clock.advance_millis(*millis)?;
+                    controller.record_harness(
+                        "clock",
+                        "advance_clock",
+                        &format!("+{millis}ms->{now}ms"),
+                    );
+                }
+                ScheduleAction::ReorderParticipantMessages { seed } => {
+                    let Some((part_store, tx, payload)) = participant else {
+                        return Err(invalid(
+                            "ReorderParticipantMessages requires a 2PC participant workload",
+                        ));
+                    };
+                    let existing_decision = journal_store.observed_decision(tx);
+                    if existing_decision == Some(Decision::Commit) {
+                        let token = tx.as_str().as_bytes().to_vec();
+                        part_store.enqueue_message(SimParticipantMessage::Commit {
+                            tx: tx.clone(),
+                            token,
+                        });
+                        part_store.enqueue_message(SimParticipantMessage::Prepare {
+                            tx: tx.clone(),
+                            payload: payload.to_vec(),
+                        });
+                    } else if existing_decision == Some(Decision::Abort) {
+                        part_store.enqueue_message(SimParticipantMessage::Abort {
+                            tx: tx.clone(),
+                            token: None,
+                        });
+                        part_store.enqueue_message(SimParticipantMessage::Prepare {
+                            tx: tx.clone(),
+                            payload: payload.to_vec(),
+                        });
+                    } else {
+                        part_store.enqueue_message(SimParticipantMessage::Prepare {
+                            tx: tx.clone(),
+                            payload: payload.to_vec(),
+                        });
+                        part_store.enqueue_message(SimParticipantMessage::Prepare {
+                            tx: tx.clone(),
+                            payload: payload.to_vec(),
+                        });
+                    }
+                    let _ = part_store.drain_reordered(*seed).await;
+                    controller.record_harness(
+                        part_store.id().as_str(),
+                        "reorder_messages",
+                        &format!("seed={seed}"),
+                    );
+                }
+                ScheduleAction::CrashAndReopen => {
+                    journal_store.simulate_crash_and_reopen();
+                }
+                ScheduleAction::InjectFault { .. }
+                | ScheduleAction::ExtraRecoveryPass
+                | ScheduleAction::CompactJournal { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_post_recovery_native_actions(
+        controller: &SimController,
+        journal_store: &SimJournalStore,
+        backend_store: &SimBackendStore,
+        mut engine: Engine<SimJournal, SimBackend>,
+        op_id: &OperationId,
+        expected_progress: &Progress,
+        compact_after_recovery: bool,
+        actions: &[ScheduleAction],
+        violation: &mut Option<InvariantViolation>,
+    ) -> Result<Engine<SimJournal, SimBackend>, Error> {
+        let ns = journal_store.namespace();
+        let mut compacted_by_action = false;
+        for action in actions {
+            match action {
+                ScheduleAction::ExtraRecoveryPass => {
+                    controller.record_harness(&ns, "extra_recovery_pass", "recover");
+                    let _ = RecoveryTarget::pending_work(&engine)?;
+                    let _ = RecoveryTarget::recover_one(
+                        &mut engine,
+                        op_id.as_str(),
+                        &Cancellation::default(),
+                    )
+                    .await?;
+                    let _ = engine.recover(&Cancellation::default()).await?;
+                    let after = engine
+                        .status(op_id)?
+                        .expect("operation retained after extra recovery");
+                    if &after.progress != expected_progress && violation.is_none() {
+                        *violation = Some(InvariantViolation {
+                            invariant: Invariant::ImmutableDecision,
+                            step: controller.step_count(),
+                            detail: format!(
+                                "native progress changed during extra recovery pass: {:?} != {:?}",
+                                after.progress, expected_progress
+                            ),
+                        });
+                    }
+                }
+                ScheduleAction::CompactJournal { archive } if journal_store.head_sequence() > 0 => {
+                    compacted_by_action = true;
+                    engine.compact(if *archive {
+                        Retention::Archive
+                    } else {
+                        Retention::Compact
+                    })?;
+                    drop(engine);
+                    engine = Engine::open(
+                        journal_store.open()?,
+                        backend_store.open(),
+                        ExecutionPolicy::default(),
+                    )?;
+                    let after = engine
+                        .status(op_id)?
+                        .expect("operation retained after compact");
+                    if &after.progress != expected_progress && violation.is_none() {
+                        *violation = Some(InvariantViolation {
+                            invariant: Invariant::ImmutableDecision,
+                            step: controller.step_count(),
+                            detail: format!(
+                                "native progress changed across compaction: {:?} != {:?}",
+                                after.progress, expected_progress
+                            ),
+                        });
+                    }
+                    if *archive
+                        && journal_store.archived_entries().is_empty()
+                        && violation.is_none()
+                    {
+                        *violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "archive compaction did not retain covered native entries"
+                                .into(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if compact_after_recovery && !compacted_by_action && journal_store.head_sequence() > 0 {
+            engine.compact(Retention::Compact)?;
+            drop(engine);
+            engine = Engine::open(
+                journal_store.open()?,
+                backend_store.open(),
+                ExecutionPolicy::default(),
+            )?;
+            let after = engine
+                .status(op_id)?
+                .expect("operation retained after compact");
+            if &after.progress != expected_progress && violation.is_none() {
+                *violation = Some(InvariantViolation {
+                    invariant: Invariant::ImmutableDecision,
+                    step: controller.step_count(),
+                    detail: "native progress changed across compaction".into(),
+                });
+            }
+        }
+        Ok(engine)
+    }
+
     async fn run_two_phase(
         &self,
         schedule: &SimSchedule,
@@ -3706,45 +3998,17 @@ impl StateExplorer {
             }
         }
         journal_store.crash_active_session();
-        controller.clear_crash();
+        controller.reset_for_recovery();
 
-        // Execute post-fault schedule actions (clock advance, message reorder, crash/reopen).
-        for action in &schedule.actions {
-            match action {
-                ScheduleAction::AdvanceClock { millis } => {
-                    let _ = clock.advance_millis(*millis);
-                }
-                ScheduleAction::ReorderParticipantMessages { seed } => {
-                    let existing_decision = journal_store.observed_decision(&tx);
-                    if existing_decision == Some(Decision::Commit) {
-                        let token = tx.as_str().as_bytes().to_vec();
-                        part_a.enqueue_message(SimParticipantMessage::Commit {
-                            tx: tx.clone(),
-                            token: token.clone(),
-                        });
-                        part_a.enqueue_message(SimParticipantMessage::Prepare {
-                            tx: tx.clone(),
-                            payload: b"10".to_vec(),
-                        });
-                    } else if existing_decision == Some(Decision::Abort) {
-                        part_a.enqueue_message(SimParticipantMessage::Abort {
-                            tx: tx.clone(),
-                            token: None,
-                        });
-                        part_a.enqueue_message(SimParticipantMessage::Prepare {
-                            tx: tx.clone(),
-                            payload: b"10".to_vec(),
-                        });
-                    }
-                    let _ = part_a.drain_reordered(*seed).await;
-                }
-                ScheduleAction::CrashAndReopen => {
-                    journal_store.crash_active_session();
-                    controller.clear_crash();
-                }
-                _ => {}
-            }
-        }
+        // Execute pre-recovery schedule actions (clock advance, message reorder, crash/reopen).
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            Some((&part_a, &tx, b"10")),
+            &schedule.actions,
+        )
+        .await?;
 
         // Clean recovery pass on reopened journal.
         controller.reset_for_recovery();
@@ -3757,29 +4021,68 @@ impl StateExplorer {
         let statuses = coordinator.recover(&Cancellation::default()).await?;
         let status = coordinator.status(&tx)?;
 
-        if (compact_after_recovery
-            || schedule
-                .actions
-                .iter()
-                .any(|a| matches!(a, ScheduleAction::CompactJournal { .. })))
-            && journal_store.head_sequence() > 0
-        {
-            let archive = schedule
-                .actions
-                .iter()
-                .any(|a| matches!(a, ScheduleAction::CompactJournal { archive: true }));
-            coordinator.compact(if archive {
-                Retention::Archive
-            } else {
-                Retention::Compact
-            })?;
+        // Execute post-recovery schedule actions (extra recovery passes and compaction).
+        let mut compacted_by_action = false;
+        for action in &schedule.actions {
+            match action {
+                ScheduleAction::ExtraRecoveryPass => {
+                    controller.record_harness("sim-2pc", "extra_recovery_pass", "recover");
+                    let pending = RecoveryTarget::pending_work(&coordinator)?;
+                    if !pending.is_empty() && violation.is_none() {
+                        violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "pending work remained before extra 2PC recovery pass".into(),
+                        });
+                    }
+                    let _ = coordinator.recover(&Cancellation::default()).await?;
+                }
+                ScheduleAction::CompactJournal { archive } if journal_store.head_sequence() > 0 => {
+                    compacted_by_action = true;
+                    coordinator.compact(if *archive {
+                        Retention::Archive
+                    } else {
+                        Retention::Compact
+                    })?;
+                    drop(coordinator);
+                    coordinator = Coordinator::open(
+                        journal_store.open()?,
+                        vec![part_a.handle(), part_b.handle()],
+                        Self::fast_retry_policy(),
+                    )?;
+                    let pending = RecoveryTarget::pending_work(&coordinator)?;
+                    if !pending.is_empty() && violation.is_none() {
+                        violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "pending work remained after clean 2PC recovery and compaction"
+                                .into(),
+                        });
+                    }
+                    let _ = coordinator.recover(&Cancellation::default()).await?;
+                    if *archive
+                        && journal_store.archived_entries().is_empty()
+                        && violation.is_none()
+                    {
+                        violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "archive compaction did not retain covered 2PC entries".into(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if compact_after_recovery && !compacted_by_action && journal_store.head_sequence() > 0 {
+            coordinator.compact(Retention::Compact)?;
             drop(coordinator);
             coordinator = Coordinator::open(
                 journal_store.open()?,
                 vec![part_a.handle(), part_b.handle()],
                 Self::fast_retry_policy(),
             )?;
-            // Second recovery via RecoveryTarget trait if any work remained or to verify idempotency.
             let pending = RecoveryTarget::pending_work(&coordinator)?;
             if !pending.is_empty() && violation.is_none() {
                 violation = Some(InvariantViolation {
@@ -3911,7 +4214,7 @@ impl StateExplorer {
         compact_after_recovery: bool,
     ) -> Result<SimTrace, Error> {
         let clock = SimClock::new(1_000);
-        let controller = SimController::new(clock, None);
+        let controller = SimController::new(clock.clone(), None);
         for action in &schedule.actions {
             if let ScheduleAction::InjectFault { rule } = action {
                 controller.add_rule(rule.clone())?;
@@ -3967,6 +4270,16 @@ impl StateExplorer {
         journal_store.crash_active_session();
         controller.reset_for_recovery();
 
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            None,
+            &schedule.actions,
+        )
+        .await?;
+        controller.reset_for_recovery();
+
         let mut engine = Engine::open(
             journal_store.open()?,
             backend_store.open(),
@@ -3976,23 +4289,19 @@ impl StateExplorer {
         let status = engine
             .execute(op_id.clone(), request, &Cancellation::default())
             .await?;
-        if compact_after_recovery {
-            engine.compact(Retention::Compact)?;
-            drop(engine);
-            engine = Engine::open(
-                journal_store.open()?,
-                backend_store.open(),
-                ExecutionPolicy::default(),
-            )?;
-            let after_compact = engine.status(&op_id)?.expect("retained after compact");
-            if after_compact.progress != status.progress && violation.is_none() {
-                violation = Some(InvariantViolation {
-                    invariant: Invariant::ImmutableDecision,
-                    step: controller.step_count(),
-                    detail: "native atomic progress changed across compaction".into(),
-                });
-            }
-        }
+
+        let _engine = Self::execute_post_recovery_native_actions(
+            &controller,
+            &journal_store,
+            &backend_store,
+            engine,
+            &op_id,
+            &status.progress,
+            compact_after_recovery,
+            &schedule.actions,
+            &mut violation,
+        )
+        .await?;
 
         let expected = if valid_payload { 7 } else { 0 };
         let expected_progress = Progress::Atomic(if valid_payload {
@@ -4051,7 +4360,7 @@ impl StateExplorer {
         pause_after_first: bool,
     ) -> Result<SimTrace, Error> {
         let clock = SimClock::new(1_000);
-        let controller = SimController::new(clock, None);
+        let controller = SimController::new(clock.clone(), None);
         for action in &schedule.actions {
             if let ScheduleAction::InjectFault { rule } = action {
                 controller.add_rule(rule.clone())?;
@@ -4084,17 +4393,38 @@ impl StateExplorer {
             ..ExecutionPolicy::default()
         };
 
+        let mut violation = None;
         if let Ok(journal) = journal_store.open()
             && let Ok(mut engine) = Engine::open(journal, backend_store.open(), policy)
         {
-            let _ = engine
+            let res = engine
                 .execute(op_id.clone(), request.clone(), &Cancellation::default())
                 .await;
+            if matches!(res, Err(Error::InDoubt { .. }))
+                && !matches!(engine.status(&op_id), Err(Error::InDoubt { .. }))
+            {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::PoisonedOnUncertainty,
+                    step: controller.step_count(),
+                    detail: "native chunked engine did not poison handle on journal write error"
+                        .into(),
+                });
+            }
             if pause_after_first {
                 let _ = engine.cancel(&op_id).await;
             }
         }
         journal_store.crash_active_session();
+        controller.reset_for_recovery();
+
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            None,
+            &schedule.actions,
+        )
+        .await?;
         controller.reset_for_recovery();
 
         let mut engine = Engine::open(
@@ -4107,7 +4437,19 @@ impl StateExplorer {
             .execute(op_id.clone(), request, &Cancellation::default())
             .await?;
 
-        let mut violation = None;
+        let _engine = Self::execute_post_recovery_native_actions(
+            &controller,
+            &journal_store,
+            &backend_store,
+            engine,
+            &op_id,
+            &status.progress,
+            false,
+            &schedule.actions,
+            &mut violation,
+        )
+        .await?;
+
         let expected_progress = Progress::Chunked(ChunkStatus {
             completed: if reject_last { chunks - 1 } else { chunks },
             total: chunks,
@@ -4115,25 +4457,27 @@ impl StateExplorer {
             paused: false,
             rejected: reject_last,
         });
-        if status.progress != expected_progress {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::DurableReceiptConsistency,
-                step: controller.step_count(),
-                detail: format!(
-                    "chunked progress {:?} != expected {:?}",
-                    status.progress, expected_progress
-                ),
-            });
-        } else if backend_store.value("counter") != expected_total {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::ExactlyOnceEffects,
-                step: controller.step_count(),
-                detail: format!(
-                    "chunked counter {} != expected {}",
-                    backend_store.value("counter"),
-                    expected_total
-                ),
-            });
+        if violation.is_none() {
+            if status.progress != expected_progress {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::DurableReceiptConsistency,
+                    step: controller.step_count(),
+                    detail: format!(
+                        "chunked progress {:?} != expected {:?}",
+                        status.progress, expected_progress
+                    ),
+                });
+            } else if backend_store.value("counter") != expected_total {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::ExactlyOnceEffects,
+                    step: controller.step_count(),
+                    detail: format!(
+                        "chunked counter {} != expected {}",
+                        backend_store.value("counter"),
+                        expected_total
+                    ),
+                });
+            }
         }
 
         let summary = SimOutcomeSummary {
@@ -4163,7 +4507,7 @@ impl StateExplorer {
         valid_payload: bool,
     ) -> Result<SimTrace, Error> {
         let clock = SimClock::new(1_000);
-        let controller = SimController::new(clock, None);
+        let controller = SimController::new(clock.clone(), None);
         for action in &schedule.actions {
             if let ScheduleAction::InjectFault { rule } = action {
                 controller.add_rule(rule.clone())?;
@@ -4188,15 +4532,36 @@ impl StateExplorer {
             payload,
         });
 
+        let mut violation = None;
         if let Ok(journal) = journal_store.open()
             && let Ok(mut engine) =
                 Engine::open(journal, backend_store.open(), ExecutionPolicy::default())
         {
-            let _ = engine
+            let res = engine
                 .execute(op_id.clone(), request.clone(), &Cancellation::default())
                 .await;
+            if matches!(res, Err(Error::InDoubt { .. }))
+                && !matches!(engine.status(&op_id), Err(Error::InDoubt { .. }))
+            {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::PoisonedOnUncertainty,
+                    step: controller.step_count(),
+                    detail: "native publish engine did not poison handle on journal write error"
+                        .into(),
+                });
+            }
         }
         journal_store.crash_active_session();
+        controller.reset_for_recovery();
+
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            None,
+            &schedule.actions,
+        )
+        .await?;
         controller.reset_for_recovery();
 
         let mut engine = Engine::open(
@@ -4209,6 +4574,19 @@ impl StateExplorer {
             .execute(op_id.clone(), request, &Cancellation::default())
             .await?;
 
+        let _engine = Self::execute_post_recovery_native_actions(
+            &controller,
+            &journal_store,
+            &backend_store,
+            engine,
+            &op_id,
+            &status.progress,
+            false,
+            &schedule.actions,
+            &mut violation,
+        )
+        .await?;
+
         let expected_status = if !valid_payload {
             PublishStatus::Aborted
         } else if expected_generation == 0 {
@@ -4216,32 +4594,36 @@ impl StateExplorer {
         } else {
             PublishStatus::Conflict
         };
-        let mut violation = None;
-        if status.progress != Progress::StagedPublish(expected_status) {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::DurableReceiptConsistency,
-                step: controller.step_count(),
-                detail: format!(
-                    "publish progress {:?} != expected {:?}",
-                    status.progress, expected_status
-                ),
-            });
-        } else if expected_status == PublishStatus::Published {
-            if backend_store.visible(&target_id).is_none() || !backend_store.has_artifact(&op_id) {
+        if violation.is_none() {
+            if status.progress != Progress::StagedPublish(expected_status) {
                 violation = Some(InvariantViolation {
                     invariant: Invariant::DurableReceiptConsistency,
                     step: controller.step_count(),
-                    detail: "published artifact missing from visible pointer or storage".into(),
+                    detail: format!(
+                        "publish progress {:?} != expected {:?}",
+                        status.progress, expected_status
+                    ),
+                });
+            } else if expected_status == PublishStatus::Published {
+                if backend_store.visible(&target_id).is_none()
+                    || !backend_store.has_artifact(&op_id)
+                {
+                    violation = Some(InvariantViolation {
+                        invariant: Invariant::DurableReceiptConsistency,
+                        step: controller.step_count(),
+                        detail: "published artifact missing from visible pointer or storage".into(),
+                    });
+                }
+            } else if backend_store.visible(&target_id).is_some()
+                || backend_store.has_artifact(&op_id)
+            {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::ExactlyOnceEffects,
+                    step: controller.step_count(),
+                    detail: "aborted or conflicted publish left visible state or orphan artifact"
+                        .into(),
                 });
             }
-        } else if backend_store.visible(&target_id).is_some() || backend_store.has_artifact(&op_id)
-        {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::ExactlyOnceEffects,
-                step: controller.step_count(),
-                detail: "aborted or conflicted publish left visible state or orphan artifact"
-                    .into(),
-            });
         }
 
         let visible_val = backend_store
@@ -4276,7 +4658,7 @@ impl StateExplorer {
         irreversible_first: bool,
     ) -> Result<SimTrace, Error> {
         let clock = SimClock::new(1_000);
-        let controller = SimController::new(clock, None);
+        let controller = SimController::new(clock.clone(), None);
         for action in &schedule.actions {
             if let ScheduleAction::InjectFault { rule } = action {
                 controller.add_rule(rule.clone())?;
@@ -4349,6 +4731,7 @@ impl StateExplorer {
             retry_backoff: Duration::ZERO,
         };
 
+        let mut violation = None;
         if let Ok(journal) = journal_store.open()
             && let Ok(mut engine) = SagaEngine::open(
                 journal,
@@ -4360,9 +4743,28 @@ impl StateExplorer {
                 policy.clone(),
             )
         {
-            let _ = engine.execute(spec.clone(), &Cancellation::default()).await;
+            let res = engine.execute(spec.clone(), &Cancellation::default()).await;
+            if matches!(res, Err(Error::InDoubt { .. }))
+                && !matches!(engine.status(&spec.id), Err(Error::InDoubt { .. }))
+            {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::PoisonedOnUncertainty,
+                    step: controller.step_count(),
+                    detail: "saga engine did not poison handle on journal write error".into(),
+                });
+            }
         }
         journal_store.crash_active_session();
+        controller.reset_for_recovery();
+
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            None,
+            &schedule.actions,
+        )
+        .await?;
         controller.reset_for_recovery();
 
         let mut engine = SagaEngine::open(
@@ -4377,7 +4779,29 @@ impl StateExplorer {
             .await?;
         if status.outcome == SagaOutcome::Uncertain {
             let _ = engine.retry(&spec.id, "sim reconcile");
-            status = engine.execute(spec, &Cancellation::default()).await?;
+            status = engine
+                .execute(spec.clone(), &Cancellation::default())
+                .await?;
+        }
+
+        for action in &schedule.actions {
+            if matches!(action, ScheduleAction::ExtraRecoveryPass) {
+                controller.record_harness("sim-saga", "extra_recovery_pass", "recover");
+                let _ = engine.recover_pending(&Cancellation::default()).await?;
+                let after = engine
+                    .status(&spec.id)?
+                    .expect("saga retained after extra recovery");
+                if after.outcome != status.outcome && violation.is_none() {
+                    violation = Some(InvariantViolation {
+                        invariant: Invariant::ImmutableDecision,
+                        step: controller.step_count(),
+                        detail: format!(
+                            "saga outcome changed during extra recovery pass: {:?} != {:?}",
+                            after.outcome, status.outcome
+                        ),
+                    });
+                }
+            }
         }
 
         let expected_outcome = if !fail_second_forward {
@@ -4394,26 +4818,27 @@ impl StateExplorer {
         } else {
             0
         };
-        let mut violation = None;
-        if status.outcome != expected_outcome {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::DurableReceiptConsistency,
-                step: controller.step_count(),
-                detail: format!(
-                    "saga outcome {:?} != expected {:?}",
-                    status.outcome, expected_outcome
-                ),
-            });
-        } else if saga_store.net_value() != expected_net {
-            violation = Some(InvariantViolation {
-                invariant: Invariant::ExactlyOnceEffects,
-                step: controller.step_count(),
-                detail: format!(
-                    "saga net value {} != expected {}",
-                    saga_store.net_value(),
-                    expected_net
-                ),
-            });
+        if violation.is_none() {
+            if status.outcome != expected_outcome {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::DurableReceiptConsistency,
+                    step: controller.step_count(),
+                    detail: format!(
+                        "saga outcome {:?} != expected {:?}",
+                        status.outcome, expected_outcome
+                    ),
+                });
+            } else if saga_store.net_value() != expected_net {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::ExactlyOnceEffects,
+                    step: controller.step_count(),
+                    detail: format!(
+                        "saga net value {} != expected {}",
+                        saga_store.net_value(),
+                        expected_net
+                    ),
+                });
+            }
         }
 
         let summary = SimOutcomeSummary {
@@ -4494,6 +4919,7 @@ impl StateExplorer {
         let mut stale_journal = journal_store.open_fenced(grant1.clone())?;
         let stale_part = part_store.fenced_handle(grant1.clone());
 
+        let mut violation = None;
         if let Ok(j1) = journal_store.open_fenced(grant1.clone())
             && let Ok(mut coord1) = Coordinator::open(
                 j1,
@@ -4501,23 +4927,44 @@ impl StateExplorer {
                 Self::fast_retry_policy(),
             )
         {
-            let _ = coord1
+            let res = coord1
                 .execute(tx.clone(), requests.clone(), &Cancellation::default())
                 .await;
+            if matches!(res, Err(Error::InDoubt { .. }))
+                && (!coord1.diagnostics().reopen_required
+                    || !matches!(coord1.status(&tx), Err(Error::InDoubt { .. })))
+            {
+                violation = Some(InvariantViolation {
+                    invariant: Invariant::PoisonedOnUncertainty,
+                    step: controller.step_count(),
+                    detail: "fenced coordinator did not poison handle on journal write error"
+                        .into(),
+                });
+            }
         }
         controller.reset_for_recovery();
 
-        // Acquire or retrieve the takeover grant.
-        let grant2 = if let Some(taken) = controller.latest_takeover() {
-            authority.renew(&taken, 5_000)?;
-            taken
-        } else {
-            clock.advance_millis(1_000)?;
-            authority.acquire("owner-2", 5_000)?
+        // Execute pre-recovery schedule actions (clock advance, message reorder, crash/reopen).
+        Self::execute_interleaving_actions(
+            &clock,
+            &controller,
+            &journal_store,
+            Some((&part_store, &tx, b"7")),
+            &schedule.actions,
+        )
+        .await?;
+        controller.reset_for_recovery();
+
+        // Acquire or renew the takeover grant after any clock advances.
+        let grant2 = match controller.latest_takeover() {
+            Some(taken) if authority.renew(&taken, 5_000).is_ok() => taken,
+            _ => {
+                clock.advance_millis(1_000)?;
+                authority.acquire("owner-2", 5_000)?
+            }
         };
 
-        let mut violation = None;
-        if delayed_stale_calls {
+        if delayed_stale_calls && violation.is_none() {
             // Delayed stale owner attempts must all be rejected with StaleOwner.
             let _ = stale_journal.append(1, b"stale staged record");
             if stale_journal.flush().is_ok()
@@ -4537,10 +4984,55 @@ impl StateExplorer {
         let decision_before_takeover = journal_store.observed_decision(&tx);
         let mut coord2 = Coordinator::open(
             journal_store.open_fenced(grant2.clone())?,
-            vec![part_store.fenced_handle(grant2)],
+            vec![part_store.fenced_handle(grant2.clone())],
             Self::fast_retry_policy(),
         )?;
         let _ = coord2.recover(&Cancellation::default()).await?;
+
+        for action in &schedule.actions {
+            match action {
+                ScheduleAction::ExtraRecoveryPass => {
+                    controller.record_harness("fenced-scope", "extra_recovery_pass", "recover");
+                    let pending = RecoveryTarget::pending_work(&coord2)?;
+                    if !pending.is_empty() && violation.is_none() {
+                        violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "pending work remained before extra fenced recovery pass"
+                                .into(),
+                        });
+                    }
+                    let _ = coord2.recover(&Cancellation::default()).await?;
+                }
+                ScheduleAction::CompactJournal { archive } if journal_store.head_sequence() > 0 => {
+                    coord2.compact(if *archive {
+                        Retention::Archive
+                    } else {
+                        Retention::Compact
+                    })?;
+                    drop(coord2);
+                    coord2 = Coordinator::open(
+                        journal_store.open_fenced(grant2.clone())?,
+                        vec![part_store.fenced_handle(grant2.clone())],
+                        Self::fast_retry_policy(),
+                    )?;
+                    let _ = coord2.recover(&Cancellation::default()).await?;
+                    if *archive
+                        && journal_store.archived_entries().is_empty()
+                        && violation.is_none()
+                    {
+                        violation = Some(InvariantViolation {
+                            invariant: Invariant::DurableReceiptConsistency,
+                            step: controller.step_count(),
+                            detail: "archive compaction did not retain covered fenced entries"
+                                .into(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let final_status = coord2.status(&tx)?;
         let final_decision = final_status.as_ref().and_then(|s| s.decision);
         let final_outcome = final_status.as_ref().map(|s| s.outcome.clone());
@@ -4700,5 +5192,184 @@ mod tests {
             .unwrap();
         assert_eq!(shrunk.minimal_schedule.actions.len(), 1);
         assert!(shrunk.to_string().contains("synthetic crash detector"));
+    }
+
+    #[tokio::test]
+    async fn schedule_actions_execute_across_workloads_and_reject_unsupported_combinations() {
+        let explorer = StateExplorer::new(ExplorationConfig::default()).unwrap();
+
+        let common_actions = vec![
+            ScheduleAction::AdvanceClock { millis: 250 },
+            ScheduleAction::CrashAndReopen,
+            ScheduleAction::ExtraRecoveryPass,
+            ScheduleAction::CompactJournal { archive: true },
+        ];
+
+        for workload in [
+            SimWorkload::TwoPhaseCommit {
+                reject_second: false,
+                cancel_before_decision: false,
+                compact_after_recovery: false,
+            },
+            SimWorkload::NativeAtomic {
+                valid_payload: true,
+                compact_after_recovery: false,
+            },
+            SimWorkload::NativeChunked {
+                chunks: 2,
+                reject_last: false,
+                pause_after_first: false,
+            },
+            SimWorkload::NativeStagedPublish {
+                expected_generation: 0,
+                valid_payload: true,
+            },
+            SimWorkload::FencedRecovery {
+                takeover_before_decision: false,
+                delayed_stale_calls: true,
+            },
+        ] {
+            let mut actions = common_actions.clone();
+            if matches!(
+                workload,
+                SimWorkload::TwoPhaseCommit { .. } | SimWorkload::FencedRecovery { .. }
+            ) {
+                actions.insert(
+                    1,
+                    ScheduleAction::ReorderParticipantMessages { seed: 0x1234 },
+                );
+            }
+            let schedule = SimSchedule {
+                seed: 7,
+                workload,
+                actions,
+            };
+            let trace = explorer.run_schedule(&schedule).await.unwrap();
+            assert!(trace.violation.is_none(), "{:?}", trace.violation);
+            assert!(trace.summary.crashes_recovered >= 1);
+            assert!(
+                trace
+                    .events
+                    .iter()
+                    .any(|ev| ev.operation == "advance_clock" && ev.outcome.contains("+250ms"))
+            );
+            assert!(
+                trace
+                    .events
+                    .iter()
+                    .any(|ev| ev.operation == "crash_and_reopen")
+            );
+            assert!(
+                trace
+                    .events
+                    .iter()
+                    .any(|ev| ev.operation == "extra_recovery_pass")
+            );
+            assert!(
+                trace
+                    .events
+                    .iter()
+                    .any(|ev| ev.component == SimComponent::Journal && ev.operation == "compact")
+            );
+        }
+
+        // SagaExecution supports AdvanceClock, CrashAndReopen, and ExtraRecoveryPass.
+        let saga_schedule = SimSchedule {
+            seed: 8,
+            workload: SimWorkload::SagaExecution {
+                fail_second_forward: false,
+                uncertain_first_forward: false,
+                irreversible_first: false,
+            },
+            actions: vec![
+                ScheduleAction::AdvanceClock { millis: 150 },
+                ScheduleAction::CrashAndReopen,
+                ScheduleAction::ExtraRecoveryPass,
+            ],
+        };
+        let saga_trace = explorer.run_schedule(&saga_schedule).await.unwrap();
+        assert!(saga_trace.violation.is_none());
+        assert_eq!(saga_trace.summary.crashes_recovered, 1);
+        assert!(
+            saga_trace
+                .events
+                .iter()
+                .any(|ev| ev.operation == "advance_clock")
+        );
+        assert!(
+            saga_trace
+                .events
+                .iter()
+                .any(|ev| ev.operation == "crash_and_reopen")
+        );
+        assert!(
+            saga_trace
+                .events
+                .iter()
+                .any(|ev| ev.operation == "extra_recovery_pass")
+        );
+
+        // Unsupported action/workload combinations fail closed with InvalidInput.
+        for invalid_schedule in [
+            SimSchedule {
+                seed: 1,
+                workload: SimWorkload::NativeAtomic {
+                    valid_payload: true,
+                    compact_after_recovery: false,
+                },
+                actions: vec![ScheduleAction::ReorderParticipantMessages { seed: 1 }],
+            },
+            SimSchedule {
+                seed: 2,
+                workload: SimWorkload::SagaExecution {
+                    fail_second_forward: false,
+                    uncertain_first_forward: false,
+                    irreversible_first: false,
+                },
+                actions: vec![ScheduleAction::CompactJournal { archive: false }],
+            },
+            SimSchedule {
+                seed: 3,
+                workload: SimWorkload::NativeChunked {
+                    chunks: 2,
+                    reject_last: false,
+                    pause_after_first: false,
+                },
+                actions: vec![ScheduleAction::InjectFault {
+                    rule: FaultRule {
+                        step: 1,
+                        component: Some(SimComponent::Participant),
+                        operation: None,
+                        phase: BoundaryPhase::BeforeEffect,
+                        action: FaultAction::CrashProcess,
+                    },
+                }],
+            },
+            SimSchedule {
+                seed: 4,
+                workload: SimWorkload::TwoPhaseCommit {
+                    reject_second: false,
+                    cancel_before_decision: false,
+                    compact_after_recovery: false,
+                },
+                actions: vec![ScheduleAction::InjectFault {
+                    rule: FaultRule {
+                        step: 1,
+                        component: Some(SimComponent::Journal),
+                        operation: None,
+                        phase: BoundaryPhase::AfterEffect,
+                        action: FaultAction::ExpireLease {
+                            advance_millis: 100,
+                            takeover_owner: "owner-2".into(),
+                            ttl_millis: 500,
+                        },
+                    },
+                }],
+            },
+        ] {
+            let err = explorer.run_schedule(&invalid_schedule).await.unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidInput);
+            assert!(invalid_schedule.to_json().is_err());
+        }
     }
 }

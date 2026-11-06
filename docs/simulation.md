@@ -90,10 +90,17 @@ of `ScheduleAction`s (`InjectFault`, `AdvanceClock`,
 
 - **JSON fixtures**: `SimSchedule::to_json()` and `SimSchedule::from_json()`
   serialize and validate human-readable fixtures (`#[serde(deny_unknown_fields)]`)
-  for regression tests.
+  for regression tests. `SimSchedule::validate()` and
+  `ScheduleAction::validate_for(&SimWorkload)` reject unsupported
+  action/workload combinations (such as `ReorderParticipantMessages` on
+  non-participant workloads, `CompactJournal` on `SagaExecution`,
+  `FaultAction::ExpireLease` on unfenced workloads, or fault rules targeting
+  components unused by the workload) with `ErrorCode::InvalidInput` rather than
+  silently skipping them.
 - **Deterministic replay**: re-running `StateExplorer::run_schedule` with the
   same `SimSchedule` produces an identical `SimTrace` (ordered `TraceEvent`s,
-  `SimOutcomeSummary`, and `InvariantViolation`).
+  `SimOutcomeSummary`, and `InvariantViolation`), and `StateExplorer::explore`
+  deduplicates equivalent candidate schedules per workload.
 - **Delta-debugging shrinker**: when `StateExplorer::explore` or a custom test
   detects a violation, `StateExplorer::shrink_violation` (or `shrink_with`)
   reduces the action sequence via chunk removal, single-action elimination, and
