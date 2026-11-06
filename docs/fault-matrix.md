@@ -108,3 +108,7 @@ and participant effects. Recovery never reverses a durable commit. See
 ## Negotiated isolation
 
 See [isolation contracts and the concurrency/restart matrix](isolation.md). Tests in crates/pactum-demo/tests/isolation.rs cover negotiated capability mismatch, lost updates, write skew, phantoms, uncertain effects, receipt replay, stale fences and process death at the existing plan barriers.
+
+## Deterministic simulation and SQLite cross-check (#70)
+
+See [deterministic simulation and state-machine verification](simulation.md). `pactum_core::simulation` and `crates/pactum-demo/tests/simulation.rs` explore bounded fault/interleaving schedules across 2PC, native modes, Sagas and fenced recovery, shrink failing traces to minimal reproducible JSON fixtures, and cross-check representative schedules against `SqliteJournal`, `DurableCounter`, `SqliteBackend`, `ReferenceStore` and real `Child::kill` process termination.

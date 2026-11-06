@@ -1261,3 +1261,6 @@ pub mod scheduler;
 
 /// Optional negotiated participant isolation and conflict validation contracts.
 pub mod isolation;
+
+/// Deterministic simulation, fault injection, and state-machine invariant verification.
+pub mod simulation;

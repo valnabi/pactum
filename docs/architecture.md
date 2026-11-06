@@ -171,3 +171,10 @@ stable codes, source chains and phase-aware retry/decision guidance added by
 epic #51. `Status::transaction_outcome()` distinguishes pending delivery of a
 known decision from unknown transaction state. Local diagnostics, durable
 recovery guidance and authoritative protocol results have separate roles.
+
+## Deterministic simulation
+
+See [deterministic simulation and state-machine verification](simulation.md) for
+`pactum_core::simulation` (epic #70), which verifies 2PC, native execution modes,
+Sagas and fenced recovery invariants through the existing journal and adapter
+traits and cross-checks model schedules against SQLite and child-process crash tests.

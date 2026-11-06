@@ -199,3 +199,7 @@ no project license has been selected yet. Work is tracked by
 ## Optional isolation contracts
 
 The [isolation guide](docs/isolation.md) describes explicit per-participant isolation, optional read/write/predicate conflict evidence, frozen accepted plans and adapter enforcement at existing transaction/prepare barriers. Global snapshot and cross-resource serializability requests are rejected. Existing modes and APIs retain their guarantees.
+
+## Deterministic simulation and state-machine verification
+
+The [simulation guide](docs/simulation.md) describes `pactum_core::simulation`: a deterministic fake clock, lease/epoch fencing authority, simulated journal/participant/backend/Saga adapters with boundary fault injection, bounded interleaving exploration, delta-debugging trace shrinking, and cross-checking against real SQLite and child-process crash tests.

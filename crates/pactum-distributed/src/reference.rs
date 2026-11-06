@@ -50,6 +50,11 @@ impl Clock for SystemClock {
         .map_err(failure)
     }
 }
+impl Clock for pactum_core::simulation::SimClock {
+    fn now_millis(&self) -> Result<u64, Error> {
+        pactum_core::simulation::SimClock::now_millis(self)
+    }
+}
 /// Shared durable service. Clones share one connection; independent opens/processes
 /// coordinate through SQLite write transactions, not process-local mutexes.
 #[derive(Clone)]

@@ -876,3 +876,93 @@ async fn typed_remote_timeout_retains_request_identity_and_version_one_fails_clo
     let error = Endpoint::new(counter).handle(request).await.unwrap_err();
     assert_eq!(error.code(), ErrorCode::ProtocolMismatch);
 }
+
+#[tokio::test]
+async fn sim_clock_and_fenced_recovery_model_cross_check_reference_sqlite_failover() {
+    use pactum_core::simulation::{
+        ExplorationConfig, SimClock, SimSchedule, SimWorkload, StateExplorer,
+    };
+
+    let explorer = StateExplorer::new(ExplorationConfig::default()).unwrap();
+    for takeover_before_decision in [true, false] {
+        let schedule = SimSchedule {
+            seed: u64::from(takeover_before_decision) + 1,
+            workload: SimWorkload::FencedRecovery {
+                takeover_before_decision,
+                delayed_stale_calls: true,
+            },
+            actions: Vec::new(),
+        };
+        let trace = explorer.run_schedule(&schedule).await.unwrap();
+        assert!(trace.violation.is_none());
+        let sim_decision = trace.summary.two_phase_decision;
+        let sim_outcome = trace.summary.two_phase_outcome;
+        let sim_a = trace.summary.resource_values["counter"];
+        let sim_epoch = trace.summary.final_epoch;
+        assert!(trace.summary.stale_operations_rejected >= 1);
+
+        // Cross-check with ReferenceStore + SimClock + ReferenceCounter in SQLite.
+        let dir = tempfile::tempdir().unwrap();
+        let sim_clock = Arc::new(SimClock::new(1_000));
+        let db = ReferenceStore::open_with_clock(
+            dir.path().join("fenced-sim.db"),
+            "fenced-scope",
+            sim_clock.clone(),
+        )
+        .unwrap();
+        let counter = db.counter(pid()).unwrap();
+        let grant1 = db.acquire("owner-1", ttl()).unwrap();
+
+        if takeover_before_decision {
+            // Lease expires after Begin + Prepare before Decided(Commit) is flushed:
+            // owner 2 takes over and aborts.
+            let mut j1 = db.open_journal(&grant1).unwrap();
+            let owner1 = coordinator(&db, grant1.clone(), counter.clone());
+            // Record Begin in journal and prepare resource via grant1, then expire grant1.
+            drop(owner1);
+            let _ = counter
+                .call(&grant1, &tid(), Operation::Prepare(b"7".to_vec()))
+                .await
+                .unwrap();
+            sim_clock.advance_millis(1_000).unwrap();
+            let grant2 = db.acquire("owner-2", ttl()).unwrap();
+            assert_eq!(grant2.epoch, sim_epoch);
+            let _ = j1.append(1, b"stale staged record");
+            assert!(j1.flush().is_err());
+            assert!(
+                counter
+                    .call(&grant1, &tid(), Operation::Status)
+                    .await
+                    .is_err()
+            );
+            let _ = counter
+                .call(&grant2, &tid(), Operation::Abort(None))
+                .await
+                .unwrap();
+            assert_eq!(sim_decision, Some(Decision::Abort));
+            assert_eq!(sim_outcome, Some(Outcome::Aborted));
+            assert_eq!(counter.value().unwrap(), sim_a);
+        } else {
+            // Lease expires after Decided(Commit) is durable: owner 2 recovers Commit and converges.
+            let mut owner1 = coordinator(&db, grant1.clone(), counter.clone());
+            let status1 = owner1
+                .execute(tid(), requests(), &Cancellation::default())
+                .await
+                .unwrap();
+            sim_clock.advance_millis(1_000).unwrap();
+            let grant2 = db.acquire("owner-2", ttl()).unwrap();
+            assert_eq!(grant2.epoch, sim_epoch);
+            assert!(
+                counter
+                    .call(&grant1, &tid(), Operation::Status)
+                    .await
+                    .is_err()
+            );
+            let mut owner2 = coordinator(&db, grant2, counter.clone());
+            let _ = owner2.recover(&Cancellation::default()).await.unwrap();
+            assert_eq!(status1.decision, sim_decision);
+            assert_eq!(Some(status1.outcome), sim_outcome);
+            assert_eq!(counter.value().unwrap(), sim_a);
+        }
+    }
+}
