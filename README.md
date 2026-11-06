@@ -195,3 +195,7 @@ same SQLite files; no hosted CI is required. `Cargo.lock` pins dependencies.
 Unsafe Rust is forbidden. Public APIs are documented. Publishing is disabled;
 no project license has been selected yet. Work is tracked by
 [v0.1 epic #1](https://github.com/valnabi/pactum/issues/1) and [v0.2 epic #11](https://github.com/valnabi/pactum/issues/11).
+
+## Optional isolation contracts
+
+The [isolation guide](docs/isolation.md) describes explicit per-participant isolation, optional read/write/predicate conflict evidence, frozen accepted plans and adapter enforcement at existing transaction/prepare barriers. Global snapshot and cross-resource serializability requests are rejected. Existing modes and APIs retain their guarantees.

@@ -104,3 +104,7 @@ prepare and finalization, immutable request/response identity, partitions, lost
 replies, checkpoint takeover and real process death after prepare, durable decision
 and participant effects. Recovery never reverses a durable commit. See
 [ADR 0004](adr/0004-distributed-ownership.md) for enforcement assumptions.
+
+## Negotiated isolation
+
+See [isolation contracts and the concurrency/restart matrix](isolation.md). Tests in crates/pactum-demo/tests/isolation.rs cover negotiated capability mismatch, lost updates, write skew, phantoms, uncertain effects, receipt replay, stale fences and process death at the existing plan barriers.

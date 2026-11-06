@@ -183,3 +183,5 @@ source/context propagation, safe retry guidance and migration details.
 
 The optional [transaction planner](transaction-planner.md) generates validated DAGs
 from declarative intent and frozen provider capabilities without executing work.
+
+Optional [isolation contracts](isolation.md) bind negotiated resource guarantees and conflict footprints through dedicated step adapters, using this same runner, journal, scheduler and recovery interface.

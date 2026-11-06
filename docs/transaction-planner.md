@@ -140,3 +140,5 @@ receipt and CAS guarantees. Live FDB validation remains conditional on that
 adapter and an installed runtime.
 
 Run locally: `cargo fmt --all -- --check`, `cargo lint`, and `cargo test-all`.
+
+Optional [isolation contracts](isolation.md) negotiate per-participant guarantees and conflict evidence over accepted DAG output, bind frozen reports into execution identity, and retain the existing mode and recovery boundaries.

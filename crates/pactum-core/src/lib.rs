@@ -1258,3 +1258,6 @@ pub mod planner;
 
 /// Pluggable dispatch policies and engine-enforced admission budgets.
 pub mod scheduler;
+
+/// Optional negotiated participant isolation and conflict validation contracts.
+pub mod isolation;
